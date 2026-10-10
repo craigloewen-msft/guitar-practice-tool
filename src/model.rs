@@ -54,6 +54,8 @@ pub enum ToneKind {
     /// Crunch / distortion from the DI guitar through the built-in amp simulator.
     CrunchAmp,
     HighGainAmp,
+    /// DI guitar double-tracked through a Neural Amp Modeler capture.
+    Nam,
     /// Picked bass.
     Bass,
     FingerBass,
@@ -61,7 +63,8 @@ pub enum ToneKind {
 }
 
 impl ToneKind {
-    pub const ALL_GUITAR: [ToneKind; 6] = [
+    pub const ALL_GUITAR: [ToneKind; 7] = [
+        ToneKind::Nam,
         ToneKind::HighGain,
         ToneKind::Crunch,
         ToneKind::HighGainAmp,
@@ -79,10 +82,15 @@ impl ToneKind {
             ToneKind::HighGain => "Distortion",
             ToneKind::CrunchAmp => "Crunch (amp sim)",
             ToneKind::HighGainAmp => "Distortion (amp sim)",
+            ToneKind::Nam => "Metal (NAM amp)",
             ToneKind::Bass => "Bass (pick)",
             ToneKind::FingerBass => "Bass (finger)",
             ToneKind::Drums => "Drums",
         }
+    }
+
+    pub fn is_distorted(self) -> bool {
+        matches!(self, ToneKind::Crunch | ToneKind::HighGain | ToneKind::CrunchAmp | ToneKind::HighGainAmp | ToneKind::Nam)
     }
 
     pub fn is_bass(self) -> bool {
@@ -109,6 +117,14 @@ pub struct Track {
 }
 
 impl Track {
+    /// Default tone, preferring the neural amp for distorted parts when a capture is installed.
+    pub fn default_tone_with_nam(&self, nam_available: bool) -> ToneKind {
+        match self.default_tone() {
+            ToneKind::Crunch | ToneKind::HighGain if nam_available => ToneKind::Nam,
+            t => t,
+        }
+    }
+
     pub fn default_tone(&self) -> ToneKind {
         if self.percussion {
             return ToneKind::Drums;

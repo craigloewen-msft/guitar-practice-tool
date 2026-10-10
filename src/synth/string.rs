@@ -27,7 +27,7 @@ impl StringParams {
         match tone {
             ToneKind::Acoustic => StringParams { loop_a: 0.06, t60_low: 5.0, t60_high: 1.6, pickup: 0.0, pick: 0.17, pick_dark: 0.15 },
             ToneKind::Clean => StringParams { loop_a: 0.10, t60_low: 6.0, t60_high: 2.0, pickup: 0.22, pick: 0.15, pick_dark: 0.25 },
-            ToneKind::Crunch | ToneKind::HighGain | ToneKind::CrunchAmp | ToneKind::HighGainAmp => {
+            ToneKind::Crunch | ToneKind::HighGain | ToneKind::CrunchAmp | ToneKind::HighGainAmp | ToneKind::Nam => {
                 StringParams { loop_a: 0.10, t60_low: 7.0, t60_high: 2.5, pickup: 0.11, pick: 0.13, pick_dark: 0.2 }
             }
             ToneKind::Bass | ToneKind::FingerBass => StringParams { loop_a: 0.32, t60_low: 5.0, t60_high: 2.0, pickup: 0.18, pick: 0.2, pick_dark: 0.55 },

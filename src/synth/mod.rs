@@ -3,6 +3,7 @@
 pub mod amp;
 pub mod drums;
 pub mod dsp;
+pub mod nam;
 pub mod reverb;
 pub mod sampler;
 pub mod string;
@@ -17,12 +18,30 @@ use amp::AmpChain;
 use drums::DrumVoice;
 use dsp::{soft_limit, Rng};
 use reverb::Reverb;
-use sampler::{gm_to_kit, Bank, BankId, SampleVoice};
+use nam::NamModel;
+use sampler::{gm_to_kit, Bank, BankId, SampleVoice, Take};
 use string::{State, StringVoice};
 
 const MAX_STRING_VOICES: usize = 64;
 const MAX_DRUM_VOICES: usize = 32;
 const MAX_SAMPLE_VOICES: usize = 128;
+/// Frames rendered per block (amp models process blocks).
+const BLOCK: usize = 256;
+
+/// How guitars on the "Metal (NAM amp)" tone are produced.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NamOptions {
+    /// Two performances panned hard left/right, each through its own amp.
+    pub double_track: bool,
+    /// Use the FreePats DI only (no recorded palm mutes) instead of the hybrid DI.
+    pub freepats_di: bool,
+}
+
+impl Default for NamOptions {
+    fn default() -> Self {
+        NamOptions { double_track: true, freepats_di: false }
+    }
+}
 
 pub enum Command {
     SetSchedule(Arc<Schedule>),
@@ -40,6 +59,9 @@ pub enum Command {
     MasterVolume(f32),
     /// A sound bank finished loading.
     Bank(BankId, Arc<Bank>),
+    /// Neural Amp Modeler capture for the "Metal (NAM amp)" tone.
+    Nam(Option<Arc<NamModel>>),
+    NamOptions(NamOptions),
 }
 
 /// State shared with the UI thread.
@@ -82,7 +104,11 @@ pub struct Engine {
     chains: Vec<AmpChain>,
     tones: Vec<ToneKind>,
     mix: Vec<Mix>,
-    track_acc: Vec<[f32; 2]>,
+    /// Per-track dry L/R block buffers.
+    track_buf: Vec<[Vec<f32>; 2]>,
+    click_buf: Vec<f32>,
+    nam: Option<Arc<NamModel>>,
+    nam_opts: NamOptions,
     reverb: Reverb,
     rng: Rng,
     age: u64,
@@ -118,7 +144,10 @@ impl Engine {
             chains: Vec::new(),
             tones: Vec::new(),
             mix: Vec::new(),
-            track_acc: Vec::new(),
+            track_buf: Vec::new(),
+            click_buf: vec![0.0; BLOCK],
+            nam: None,
+            nam_opts: NamOptions::default(),
             reverb: Reverb::new(sr),
             rng: Rng::new(0x1234_5678),
             age: 0,
@@ -145,7 +174,7 @@ impl Engine {
                 }
                 self.tones = s.tracks.iter().map(|t| t.tone).collect();
                 self.chains = (0..n).map(|i| self.make_chain(i)).collect();
-                self.track_acc = vec![[0.0; 2]; n];
+                self.track_buf = (0..n).map(|_| [vec![0.0; BLOCK], vec![0.0; BLOCK]]).collect();
                 self.sched = Some(s);
                 let p = self.pos as u64;
                 self.seek(p);
@@ -199,10 +228,18 @@ impl Engine {
             Command::Bank(id, bank) => {
                 self.banks[id.index()] = Some(bank);
                 for i in 0..self.tones.len() {
-                    if BankId::for_tone(self.tones[i]) == Some(id) {
+                    if self.track_bank(i).is_some_and(|b| b.id == id) {
                         self.chains[i] = self.make_chain(i);
                     }
                 }
+            }
+            Command::Nam(m) => {
+                self.nam = m;
+                self.rebuild_nam_chains();
+            }
+            Command::NamOptions(o) => {
+                self.nam_opts = o;
+                self.rebuild_nam_chains();
             }
             Command::Loop(r) => self.loop_range = r.filter(|(a, b)| b > a),
             Command::Metronome(m) => self.metronome = m,
@@ -211,15 +248,41 @@ impl Engine {
         }
     }
 
+    fn rebuild_nam_chains(&mut self) {
+        for i in 0..self.tones.len() {
+            if self.tones[i] == ToneKind::Nam {
+                for v in self.svoices.iter_mut().filter(|v| v.track == i) {
+                    v.choke();
+                }
+                self.chains[i] = self.make_chain(i);
+            }
+        }
+    }
+
     /// Loaded sound bank for a track's tone, if any.
     fn track_bank(&self, track: usize) -> Option<&Arc<Bank>> {
         let tone = *self.tones.get(track)?;
+        if tone == ToneKind::Nam {
+            // Prefer the DI with recorded palm mutes; the plain FreePats DI also works.
+            let hybrid = self.banks[BankId::GuitarHybridDi.index()].as_ref().filter(|_| !self.nam_opts.freepats_di);
+            return hybrid.or(self.banks[BankId::GuitarDirect.index()].as_ref());
+        }
         self.banks[BankId::for_tone(tone)?.index()].as_ref()
+    }
+
+    fn is_double_tracked(&self, track: usize) -> bool {
+        self.nam_opts.double_track && self.chains.get(track).is_some_and(|c| c.is_nam())
     }
 
     fn make_chain(&self, track: usize) -> AmpChain {
         let tone = self.tones[track];
-        let processed = self.track_bank(track).is_some_and(|b| b.id.is_processed());
+        let bank = self.track_bank(track);
+        if tone == ToneKind::Nam {
+            if let (Some(model), Some(_)) = (&self.nam, bank) {
+                return AmpChain::with_nam(model, self.sr, self.nam_opts.double_track);
+            }
+        }
+        let processed = bank.is_some_and(|b| b.id.is_processed());
         AmpChain::new(tone, self.sr, processed)
     }
 
@@ -300,21 +363,18 @@ impl Engine {
             if ev.pitch as i32 == 44 {
                 e.velocity *= 0.7;
             }
-            return self.svoices[slot].start(idx, &e, &bank, key, self.sr, &mut self.rng, self.age);
+            return self.svoices[slot].start(idx, &e, &bank, key, self.sr, &mut self.rng, self.age, Take::default());
         }
-        let existing = self.svoices.iter().position(|v| {
-            matches!(v.state, State::Sounding | State::Released) && !v.drum && v.track == ev.track && v.string == ev.string
-        });
-        if ev.legato {
-            if let Some(i) = existing {
-                if self.svoices[i].level() > 1e-3 {
-                    self.svoices[i].legato(idx, ev, &bank, self.sr);
-                    return true;
-                }
+        let on_string =
+            |v: &SampleVoice| matches!(v.state, State::Sounding | State::Released) && !v.drum && v.track == ev.track && v.string == ev.string;
+        if ev.legato && self.svoices.iter().any(|v| on_string(v) && v.level() > 1e-3) {
+            for v in self.svoices.iter_mut().filter(|v| on_string(v)) {
+                v.legato(idx, ev, &bank, self.sr);
             }
+            return true;
         }
-        if let Some(i) = existing {
-            self.svoices[i].choke();
+        for v in self.svoices.iter_mut().filter(|v| on_string(v)) {
+            v.choke();
         }
         for v in self.voices.iter_mut().filter(|v| v.is_active() && v.track == ev.track && v.string == ev.string) {
             v.choke();
@@ -326,7 +386,23 @@ impl Engine {
             e.velocity *= 0.6;
         }
         let key = (ev.pitch + ev.curve_at(0.0)).round() as i32;
-        self.svoices[slot].start(idx, &e, &bank, key, self.sr, &mut self.rng, self.age)
+        let rr = (self.rng.next().abs() * 1024.0) as u32;
+        if !self.is_double_tracked(ev.track) {
+            return self.svoices[slot].start(idx, &e, &bank, key, self.sr, &mut self.rng, self.age, Take { rr, ..Take::default() });
+        }
+        // Double-tracked: a second, slightly different performance on the other side.
+        let left = Take { rr, gl: 1.0, gr: 0.0, delay: 0, detune: 0.0 };
+        let right = Take {
+            rr: rr + 1,
+            gl: 0.0,
+            gr: 1.0,
+            delay: (self.rng.next().abs() * 0.008 * self.sr) as u32,
+            detune: self.rng.next() * 0.04,
+        };
+        let ok = self.svoices[slot].start(idx, &e, &bank, key, self.sr, &mut self.rng, self.age, left);
+        let slot2 = self.alloc_sample_voice();
+        e.velocity = (e.velocity * (1.0 + self.rng.next() * 0.08)).min(1.0);
+        self.svoices[slot2].start(idx, &e, &bank, key, self.sr, &mut self.rng, self.age, right) || ok
     }
 
     fn trigger(&mut self, sched: &Schedule, idx: usize) {
@@ -403,60 +479,74 @@ impl Engine {
             out.fill(0.0);
             return;
         };
-        let sr = self.sr;
-        let n_tracks = sched.tracks.len();
-        let any_solo = self.mix.iter().any(|m| m.solo);
+        for block in out.chunks_mut(BLOCK * channels) {
+            self.process_block(&sched, block, channels);
+        }
+        self.shared.set_pos(self.pos);
+        self.shared.playing.store(self.playing || self.count_in_left > 0.0, Ordering::Relaxed);
+    }
+
+    /// Advance the transport by one frame, triggering due events.
+    fn tick(&mut self, sched: &Schedule) {
         let tempo_map = &sched.timeline.tempo_map;
-
-        for frame in out.chunks_mut(channels) {
-            if self.playing {
-                let bpm = tempo_map.get(self.tempo_idx).map(|e| e.1).unwrap_or(120.0);
-                let dt = bpm / 60.0 * TPQ as f64 / sr as f64 * self.speed;
-                if self.count_in_left > 0.0 {
-                    let before = self.count_in_left;
-                    if (before - TPQ as f64 * 4.0).abs() < 1e-9 {
-                        self.start_click(true);
-                    }
-                    self.count_in_left -= dt;
-                    if self.count_in_left > 0.0 && (before / TPQ as f64).ceil() != (self.count_in_left / TPQ as f64).ceil() {
-                        self.start_click(false);
-                    }
-                } else {
-                    while self.next_ev < sched.events.len() && sched.events[self.next_ev].start as f64 <= self.pos {
-                        let i = self.next_ev;
-                        self.next_ev += 1;
-                        self.trigger(&sched, i);
-                    }
-                    while self.next_click < sched.clicks.len() && sched.clicks[self.next_click].0 as f64 <= self.pos {
-                        let accent = sched.clicks[self.next_click].1;
-                        self.next_click += 1;
-                        if self.metronome {
-                            self.start_click(accent);
-                        }
-                    }
-                    self.pos += dt;
-                    while self.tempo_idx + 1 < tempo_map.len() && tempo_map[self.tempo_idx + 1].0 as f64 <= self.pos {
-                        self.tempo_idx += 1;
-                    }
-                    if let Some((a, b)) = self.loop_range {
-                        if self.pos >= b as f64 {
-                            self.seek(a);
-                        }
-                    }
-                    if self.pos >= sched.timeline.total as f64 {
-                        self.playing = false;
-                        for v in &mut self.voices {
-                            v.release();
-                        }
-                        for v in self.svoices.iter_mut().filter(|v| !v.drum) {
-                            v.release();
-                        }
-                    }
-                }
+        let bpm = tempo_map.get(self.tempo_idx).map(|e| e.1).unwrap_or(120.0);
+        let dt = bpm / 60.0 * TPQ as f64 / self.sr as f64 * self.speed;
+        if self.count_in_left > 0.0 {
+            let before = self.count_in_left;
+            if (before - TPQ as f64 * 4.0).abs() < 1e-9 {
+                self.start_click(true);
             }
+            self.count_in_left -= dt;
+            if self.count_in_left > 0.0 && (before / TPQ as f64).ceil() != (self.count_in_left / TPQ as f64).ceil() {
+                self.start_click(false);
+            }
+            return;
+        }
+        while self.next_ev < sched.events.len() && sched.events[self.next_ev].start as f64 <= self.pos {
+            let i = self.next_ev;
+            self.next_ev += 1;
+            self.trigger(sched, i);
+        }
+        while self.next_click < sched.clicks.len() && sched.clicks[self.next_click].0 as f64 <= self.pos {
+            let accent = sched.clicks[self.next_click].1;
+            self.next_click += 1;
+            if self.metronome {
+                self.start_click(accent);
+            }
+        }
+        self.pos += dt;
+        while self.tempo_idx + 1 < tempo_map.len() && tempo_map[self.tempo_idx + 1].0 as f64 <= self.pos {
+            self.tempo_idx += 1;
+        }
+        if let Some((a, b)) = self.loop_range {
+            if self.pos >= b as f64 {
+                self.seek(a);
+            }
+        }
+        if self.pos >= sched.timeline.total as f64 {
+            self.playing = false;
+            for v in &mut self.voices {
+                v.release();
+            }
+            for v in self.svoices.iter_mut().filter(|v| !v.drum) {
+                v.release();
+            }
+        }
+    }
 
-            for a in &mut self.track_acc {
-                *a = [0.0; 2];
+    fn process_block(&mut self, sched: &Schedule, out: &mut [f32], channels: usize) {
+        let sr = self.sr;
+        let n = out.len() / channels;
+        let n_tracks = sched.tracks.len().min(self.track_buf.len());
+        for b in &mut self.track_buf {
+            b[0][..n].fill(0.0);
+            b[1][..n].fill(0.0);
+        }
+
+        // Voices, frame by frame, into per-track dry buffers.
+        for i in 0..n {
+            if self.playing {
+                self.tick(sched);
             }
             let pos = self.pos;
             for v in self.voices.iter_mut().filter(|v| v.is_active()) {
@@ -464,18 +554,17 @@ impl Engine {
                 if v.state == State::Sounding && (pos >= ev.end as f64 || !self.playing) {
                     v.release();
                 }
-                let rel = pos - ev.start as f64;
-                let s = v.process(ev, rel, sr);
-                if let Some(acc) = self.track_acc.get_mut(v.track) {
-                    acc[0] += s;
-                    acc[1] += s;
+                let s = v.process(ev, pos - ev.start as f64, sr);
+                if let Some(b) = self.track_buf.get_mut(v.track) {
+                    b[0][i] += s;
+                    b[1][i] += s;
                 }
             }
             for d in self.drums.iter_mut().filter(|d| d.active) {
                 let s = d.process(sr, &mut self.rng);
-                if let Some(acc) = self.track_acc.get_mut(d.track) {
-                    acc[0] += s;
-                    acc[1] += s;
+                if let Some(b) = self.track_buf.get_mut(d.track) {
+                    b[0][i] += s;
+                    b[1][i] += s;
                 }
             }
             for v in self.svoices.iter_mut().filter(|v| v.is_active()) {
@@ -487,25 +576,45 @@ impl Engine {
                 if !v.drum && v.state == State::Sounding && (pos >= ev.end as f64 || !self.playing) {
                     v.release();
                 }
-                let rel = pos - ev.start as f64;
-                let (sl, sr_) = v.process(ev, rel, sr, bank);
-                if let Some(acc) = self.track_acc.get_mut(v.track) {
-                    acc[0] += sl;
-                    acc[1] += sr_;
+                let (sl, sr_) = v.process(ev, pos - ev.start as f64, sr, bank);
+                if let Some(b) = self.track_buf.get_mut(v.track) {
+                    b[0][i] += sl;
+                    b[1][i] += sr_;
                 }
             }
+            self.click_buf[i] = if self.click_t < 0.05 {
+                let c = (self.click_t * self.click_freq * std::f32::consts::TAU).sin()
+                    * (-self.click_t / 0.012).exp()
+                    * self.click_amp;
+                self.click_t += 1.0 / sr;
+                c
+            } else {
+                0.0
+            };
+        }
 
+        // Amp / cab per track.
+        let any_solo = self.mix.iter().any(|m| m.solo);
+        let audible: Vec<bool> = self.mix.iter().map(|m| !m.mute && (!any_solo || m.solo)).collect();
+        for t in 0..n_tracks {
+            let [bl, br] = &mut self.track_buf[t];
+            // Neural amp models are expensive: skip them for tracks nobody hears.
+            if self.chains[t].is_nam() && !audible[t] {
+                continue;
+            }
+            self.chains[t].process_block(&mut bl[..n], &mut br[..n]);
+        }
+
+        // Mix.
+        for (i, frame) in out.chunks_mut(channels).enumerate() {
             let (mut l, mut r) = (0.0f32, 0.0f32);
             let mut send = 0.0;
             for t in 0..n_tracks {
-                let [al, ar] = self.track_acc[t];
-                let (yl, yr) = self.chains[t].process_stereo(al, ar);
-                let m = self.mix[t];
-                let audible = !m.mute && (!any_solo || m.solo);
-                if !audible {
+                if !audible[t] {
                     continue;
                 }
-                let g = m.volume * 1.4;
+                let (yl, yr) = (self.track_buf[t][0][i], self.track_buf[t][1][i]);
+                let g = self.mix[t].volume * 1.4;
                 let pan = sched.tracks[t].pan;
                 let gl = ((1.0 - pan) * 0.5).sqrt();
                 let gr = ((1.0 + pan) * 0.5).sqrt();
@@ -514,20 +623,9 @@ impl Engine {
                 send += 0.5 * (yl + yr) * g * self.chains[t].reverb_send;
             }
             let (rl, rr) = self.reverb.process(send);
-            l += rl;
-            r += rr;
-
-            if self.click_t < 0.05 {
-                let c = (self.click_t * self.click_freq * std::f32::consts::TAU).sin()
-                    * (-self.click_t / 0.012).exp()
-                    * self.click_amp;
-                l += c;
-                r += c;
-                self.click_t += 1.0 / sr;
-            }
-
-            let l = soft_limit(l * self.master);
-            let r = soft_limit(r * self.master);
+            let c = self.click_buf[i];
+            let l = soft_limit((l + rl + c) * self.master);
+            let r = soft_limit((r + rr + c) * self.master);
             match channels {
                 1 => frame[0] = 0.5 * (l + r),
                 _ => {
@@ -539,7 +637,6 @@ impl Engine {
                 }
             }
         }
-        self.shared.set_pos(self.pos);
-        self.shared.playing.store(self.playing || self.count_in_left > 0.0, Ordering::Relaxed);
     }
 }
+

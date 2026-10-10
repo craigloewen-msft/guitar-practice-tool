@@ -1,7 +1,70 @@
 //! Per-track amplifier + cabinet simulation.
 
 use super::dsp::{Biquad, Eq};
+use super::nam::NamModel;
 use crate::model::ToneKind;
+
+/// Neural Amp Modeler stage: overdrive-style boost into one capture per side.
+struct NamStage {
+    /// One instance for a centred guitar, two (L/R) for a double-tracked one.
+    models: Vec<NamModel>,
+    pre: [Eq; 2],
+    in_gain: f32,
+    out_gain: f32,
+    post: [Eq; 2],
+    tmp: Vec<f32>,
+}
+
+impl NamStage {
+    fn new(model: &NamModel, sr: f32, stereo: bool) -> Self {
+        // Tube-screamer-like tightening in front of the amp, as metal players do.
+        let pre = || {
+            Eq(vec![
+                Biquad::highpass(sr, 110.0, 0.6),
+                Biquad::peaking(sr, 750.0, 0.9, 4.0),
+                Biquad::lowpass(sr, 6500.0, 0.7),
+            ])
+        };
+        let post = || Eq(vec![Biquad::highpass(sr, 60.0, 0.7), Biquad::lowpass(sr, 10000.0, 0.7)]);
+        // Captures are normalised to a reference output loudness; bring them to the
+        // level of the other tones.
+        let out_gain = 10f32.powf((-23.0 - model.loudness.unwrap_or(-23.0)) / 20.0) * 3.0;
+        NamStage {
+            models: (0..if stereo { 2 } else { 1 }).map(|_| model.clone()).collect(),
+            pre: [pre(), pre()],
+            in_gain: 10f32.powf(4.0 / 20.0),
+            out_gain,
+            post: [post(), post()],
+            tmp: Vec::new(),
+        }
+    }
+
+    fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
+        let n = l.len();
+        self.tmp.resize(n, 0.0);
+        if self.models.len() == 1 {
+            for i in 0..n {
+                l[i] = self.pre[0].process(0.5 * (l[i] + r[i])) * self.in_gain;
+            }
+            self.models[0].process(l, &mut self.tmp);
+            for i in 0..n {
+                let y = self.post[0].process(self.tmp[i]) * self.out_gain;
+                l[i] = y;
+                r[i] = y;
+            }
+        } else {
+            for (c, buf) in [l, r].into_iter().enumerate() {
+                for x in buf.iter_mut() {
+                    *x = self.pre[c].process(*x) * self.in_gain;
+                }
+                self.models[c].process(buf, &mut self.tmp);
+                for (x, &y) in buf.iter_mut().zip(&self.tmp) {
+                    *x = self.post[c].process(y) * self.out_gain;
+                }
+            }
+        }
+    }
+}
 
 pub struct AmpChain {
     pre: Eq,
@@ -17,6 +80,7 @@ pub struct AmpChain {
     pub reverb_send: f32,
     /// Plain stereo gain stage (samples that already include amp/cab or acoustic drums).
     passthrough: bool,
+    nam: Option<Box<NamStage>>,
 }
 
 impl AmpChain {
@@ -36,6 +100,7 @@ impl AmpChain {
             out_gain: 1.0,
             reverb_send: 0.1,
             passthrough: false,
+            nam: None,
         };
         if processed {
             chain.passthrough = true;
@@ -47,7 +112,7 @@ impl AmpChain {
             return chain;
         }
         match tone {
-            ToneKind::HighGain | ToneKind::HighGainAmp => {
+            ToneKind::HighGain | ToneKind::HighGainAmp | ToneKind::Nam => {
                 chain.pre = Eq(vec![
                     Biquad::highpass(sr, 130.0, 0.7),
                     Biquad::peaking(sr, 750.0, 0.8, 7.0),
@@ -152,6 +217,30 @@ impl AmpChain {
             x
         };
         self.post.process(y) * self.out_gain
+    }
+
+    /// A chain driven by a Neural Amp Modeler capture. `stereo`: separate amps for the
+    /// left and right takes of a double-tracked part.
+    pub fn with_nam(model: &NamModel, sr: f32, stereo: bool) -> Self {
+        let mut chain = AmpChain::new(ToneKind::Nam, sr, false);
+        chain.nam = Some(Box::new(NamStage::new(model, sr, stereo)));
+        chain.reverb_send = 0.06;
+        chain
+    }
+
+    pub fn is_nam(&self) -> bool {
+        self.nam.is_some()
+    }
+
+    /// Process a block in place.
+    pub fn process_block(&mut self, l: &mut [f32], r: &mut [f32]) {
+        if let Some(nam) = &mut self.nam {
+            nam.process(l, r);
+            return;
+        }
+        for (a, b) in l.iter_mut().zip(r.iter_mut()) {
+            (*a, *b) = self.process_stereo(*a, *b);
+        }
     }
 
     /// Stereo in/out; amp-simulated chains are mono internally.

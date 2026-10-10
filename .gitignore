@@ -6,3 +6,8 @@
 *.gpx
 /assets/*
 !/assets/.gitkeep
+
+# Neural Amp Modeler captures belong to their authors; keep them local
+*.nam
+# Generated tone comparison renders
+/tone-samples/

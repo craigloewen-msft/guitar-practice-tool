@@ -42,4 +42,23 @@ for url in "${banks[@]}"; do
   rm -f "$file"
 done
 
+# Dry humbucker DI recordings with real palm-muted takes (lotkey/free-sample-libraries-sfz),
+# used as the input for the Neural Amp Modeler tone.
+hb_base="https://raw.githubusercontent.com/lotkey/free-sample-libraries-sfz/main/guitar/humbucker"
+mkdir -p humbucker-di
+n_new=0
+for note in "G#1" "D#2" "G#2" "C#3" "F3" "A#3"; do
+  for rr in 1 2 3 4; do
+    for vel in 1 2; do
+      for mute in "" "_muted"; do
+        f="${note}_${rr}_${vel}${mute}.wav"
+        [ -s "humbucker-di/$f" ] && continue
+        curl -fsSL -o "humbucker-di/$f" "$hb_base/${f//#/%23}"
+        n_new=$((n_new + 1))
+      done
+    done
+  done
+done
+echo "✓ humbucker DI samples ($n_new downloaded)"
+
 echo "Sound banks are in $(pwd)"

@@ -66,7 +66,19 @@ fn dump(path: &PathBuf) -> anyhow::Result<()> {
         if let (Some(a), Some(b)) = (evs.first(), evs.last()) {
             let ma = sched.timeline.measures[sched.timeline.locate(a.start).unwrap()].index + 1;
             let mb = sched.timeline.measures[sched.timeline.locate(b.start).unwrap()].index + 1;
-            println!("track {t}: {} events, first in measure {ma}, last in measure {mb}", evs.len());
+            let mut p: Vec<f32> = evs.iter().map(|e| e.pitch).collect();
+            p.sort_by(f32::total_cmp);
+            let q = |f: f32| p[((p.len() - 1) as f32 * f) as usize];
+            let pm = evs.iter().filter(|e| e.palm_mute).count();
+            println!(
+                "track {t}: {} events ({pm} palm-muted), first in measure {ma}, last in measure {mb}, pitch min/p10/median/p90/max {}/{}/{}/{}/{}",
+                evs.len(),
+                q(0.0),
+                q(0.1),
+                q(0.5),
+                q(0.9),
+                q(1.0)
+            );
         }
     }
     Ok(())
@@ -76,7 +88,8 @@ fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(|s| s.as_str())
 }
 
-/// Offline render: `--render <song> <out.wav> [--speed 0.5] [--solo N] [--start-measure M] [--seconds S] [--tone T] [--synth]`
+/// Offline render: `--render <song> <out.wav> [--speed 0.5] [--solo N] [--start-measure M] [--seconds S]
+/// [--tone T] [--synth] [--nam model.nam | --no-nam] [--single] [--di freepats]`
 fn render(args: &[String]) -> anyhow::Result<()> {
     use std::sync::Arc;
     use synth::{Command, Engine, Shared};
@@ -86,13 +99,19 @@ fn render(args: &[String]) -> anyhow::Result<()> {
     let seconds: f64 = arg_value(args, "--seconds").map(|s| s.parse()).transpose()?.unwrap_or(20.0);
     let start_measure: usize = arg_value(args, "--start-measure").map(|s| s.parse()).transpose()?.unwrap_or(1);
     let sr = 48000u32;
-    let mut tones: Vec<_> = song.tracks.iter().map(|t| t.default_tone()).collect();
+    let nam_path = if args.iter().any(|a| a == "--no-nam") {
+        None
+    } else {
+        arg_value(args, "--nam").map(PathBuf::from).or_else(synth::nam::find_model)
+    };
+    let mut tones: Vec<_> = song.tracks.iter().map(|t| t.default_tone_with_nam(nam_path.is_some())).collect();
     if let Some(name) = arg_value(args, "--tone") {
         let k = model::ToneKind::ALL_GUITAR
             .into_iter()
             .find(|k| k.label().to_lowercase().replace(' ', "") == name.to_lowercase())
             .ok_or_else(|| anyhow::anyhow!("unknown tone {name}"))?;
-        for t in tones.iter_mut().filter(|t| !t.is_bass() && **t != model::ToneKind::Drums) {
+        // Only the distorted parts; clean/acoustic parts keep their tone.
+        for t in tones.iter_mut().filter(|t| t.is_distorted()) {
             *t = k;
         }
     }
@@ -104,9 +123,27 @@ fn render(args: &[String]) -> anyhow::Result<()> {
         .unwrap_or(0);
     let mut engine = Engine::new(sr as f32, Arc::new(Shared::default()), None);
     engine.handle(Command::SetSchedule(sched.clone()));
+    engine.handle(Command::NamOptions(synth::NamOptions {
+        double_track: !args.iter().any(|a| a == "--single"),
+        freepats_di: arg_value(args, "--di") == Some("freepats"),
+    }));
+    if tones.contains(&model::ToneKind::Nam) {
+        match &nam_path {
+            Some(p) => {
+                let m = synth::nam::NamModel::load(p)?;
+                println!("NAM model: {} ({})", m.name, p.display());
+                engine.handle(Command::Nam(Some(Arc::new(m))));
+            }
+            None => println!("no .nam model found; Metal (NAM amp) uses the built-in amp sim"),
+        }
+    }
     if !args.iter().any(|a| a == "--synth") {
         let lib = synth::sampler::Library::new();
         let mut ids: Vec<_> = tones.iter().filter_map(|&t| synth::sampler::BankId::for_tone(t)).collect();
+        if tones.contains(&model::ToneKind::Nam) {
+            ids.push(synth::sampler::BankId::GuitarDirect);
+        }
+        ids.sort_by_key(|i| i.index());
         ids.dedup();
         for id in ids {
             let t = std::time::Instant::now();
@@ -144,13 +181,59 @@ fn render(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run a mono WAV through a NAM capture: `--nam-render <model.nam> <in.wav> <out.wav>`
+/// (writes 32-bit float, like NeuralAmpModelerCore's `render` tool).
+fn nam_render(args: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(args.len() >= 4, "usage: --nam-render <model.nam> <in.wav> <out.wav>");
+    let mut model = synth::nam::NamModel::load(std::path::Path::new(&args[1]))?;
+    let mut reader = hound::WavReader::open(&args[2])?;
+    let spec = reader.spec();
+    let input: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().step_by(spec.channels as usize).collect::<Result<_, _>>()?,
+        hound::SampleFormat::Int => {
+            let scale = 1.0 / (1u64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .step_by(spec.channels as usize)
+                .map(|s| s.map(|v| v as f32 * scale))
+                .collect::<Result<_, _>>()?
+        }
+    };
+    if spec.sample_rate as f32 != model.sample_rate {
+        eprintln!("warning: input is {} Hz but the model expects {} Hz", spec.sample_rate, model.sample_rate);
+    }
+    let mut out = vec![0.0; input.len()];
+    let t0 = std::time::Instant::now();
+    model.process(&input, &mut out);
+    let el = t0.elapsed().as_secs_f64();
+    println!(
+        "{}: {} samples in {el:.2}s ({:.1}x realtime)",
+        model.name,
+        input.len(),
+        input.len() as f64 / model.sample_rate as f64 / el
+    );
+    let spec_out = hound::WavSpec {
+        channels: 1,
+        sample_rate: model.sample_rate as u32,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut w = hound::WavWriter::create(&args[3], spec_out)?;
+    for s in out {
+        w.write_sample(s)?;
+    }
+    w.finalize()?;
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(|s| s.as_str()) {
         Some("--dump") => dump(&PathBuf::from(&args[1])),
         Some("--render") => render(&args),
+        Some("--nam-render") => nam_render(&args),
         Some("--help") | Some("-h") => {
-            println!("usage: guitar-practice-tool [song.gp5]\n       guitar-practice-tool --dump <song>\n       guitar-practice-tool --render <song> <out.wav> [--speed x] [--solo n] [--start-measure m] [--seconds s]");
+            println!("usage: guitar-practice-tool [song.gp5]\n       guitar-practice-tool --dump <song>\n       guitar-practice-tool --render <song> <out.wav> [--speed x] [--solo n] [--start-measure m] [--seconds s]\n           [--tone t] [--synth] [--nam model.nam | --no-nam] [--single] [--di freepats]\n       guitar-practice-tool --nam-render <model.nam> <in.wav> <out.wav>");
             Ok(())
         }
         _ => run_gui(args.first().map(PathBuf::from)),

@@ -29,6 +29,14 @@ struct Loaded {
     mix: Vec<TrackMix>,
 }
 
+#[derive(Clone, PartialEq)]
+enum NamState {
+    Unrequested,
+    Loading,
+    Ready,
+    Failed(String),
+}
+
 pub struct App {
     loaded: Option<Loaded>,
     audio: Option<AudioOut>,
@@ -38,6 +46,9 @@ pub struct App {
     /// Playback speed relative to the score tempo.
     speed: f64,
     library: Arc<Library>,
+    /// Neural Amp Modeler capture found on disk, and its load status.
+    nam_path: Option<PathBuf>,
+    nam_state: Arc<std::sync::Mutex<NamState>>,
     ctx: egui::Context,
     metronome: bool,
     count_in: bool,
@@ -67,6 +78,8 @@ impl App {
             view_track: 0,
             speed: 1.0,
             library: Library::new(),
+            nam_path: crate::synth::nam::find_model(),
+            nam_state: Arc::new(std::sync::Mutex::new(NamState::Unrequested)),
             ctx: cc.egui_ctx.clone(),
             metronome: false,
             count_in: false,
@@ -94,22 +107,70 @@ impl App {
 
     /// Start loading the sound bank for a tone in the background (no-op if already requested).
     fn request_bank(&self, tone: ToneKind) {
-        let (Some(id), Some(audio)) = (BankId::for_tone(tone), &self.audio) else { return };
+        let Some(audio) = &self.audio else { return };
+        let mut ids: Vec<BankId> = BankId::for_tone(tone).into_iter().collect();
+        if tone == ToneKind::Nam {
+            // Fallback DI when the humbucker recordings are not installed.
+            ids.push(BankId::GuitarDirect);
+            self.request_nam();
+        }
+        for id in ids {
+            let tx = audio.tx.clone();
+            let ctx = self.ctx.clone();
+            self.library.request(id, move |bank| {
+                let _ = tx.send(Command::Bank(id, bank));
+                ctx.request_repaint();
+            });
+        }
+        self.ctx.request_repaint_after(std::time::Duration::from_millis(200));
+    }
+
+    /// Load the NAM capture in the background (once).
+    fn request_nam(&self) {
+        let (Some(path), Some(audio)) = (self.nam_path.clone(), &self.audio) else { return };
+        {
+            let mut st = self.nam_state.lock().unwrap();
+            if *st != NamState::Unrequested {
+                return;
+            }
+            *st = NamState::Loading;
+        }
         let tx = audio.tx.clone();
         let ctx = self.ctx.clone();
-        self.library.request(id, move |bank| {
-            let _ = tx.send(Command::Bank(id, bank));
+        let state = self.nam_state.clone();
+        std::thread::spawn(move || {
+            let r = crate::synth::nam::NamModel::load(&path);
+            *state.lock().unwrap() = match r {
+                Ok(m) => {
+                    let _ = tx.send(Command::Nam(Some(Arc::new(m))));
+                    NamState::Ready
+                }
+                Err(e) => NamState::Failed(format!("{e:#}")),
+            };
             ctx.request_repaint();
         });
-        self.ctx.request_repaint_after(std::time::Duration::from_millis(200));
     }
 
     fn sound_status(&self) -> Option<(String, bool)> {
         let l = self.loaded.as_ref()?;
         let mut loading = Vec::new();
         let mut missing = Vec::new();
+        let nam_used = l.mix.iter().any(|m| m.tone == ToneKind::Nam);
+        if nam_used {
+            match &*self.nam_state.lock().unwrap() {
+                NamState::Loading => loading.push("neural amp model"),
+                NamState::Failed(e) => return Some((format!("Could not load the NAM capture: {e}"), true)),
+                _ if self.nam_path.is_none() => {
+                    return Some(("No .nam capture found, Metal (NAM amp) uses the built-in amp sim. Put a .nam file in assets/".into(), true));
+                }
+                _ => {}
+            }
+        }
         for m in &l.mix {
-            let Some(id) = BankId::for_tone(m.tone) else { continue };
+            let Some(mut id) = BankId::for_tone(m.tone) else { continue };
+            if m.tone == ToneKind::Nam && matches!(self.library.state(id), SlotState::Missing | SlotState::Failed(_)) {
+                id = BankId::GuitarDirect;
+            }
             match self.library.state(id) {
                 SlotState::Loading | SlotState::Unrequested => loading.push(id.label()),
                 SlotState::Missing | SlotState::Failed(_) => missing.push(id.label()),
@@ -137,7 +198,7 @@ impl App {
                 let mix: Vec<TrackMix> = song
                     .tracks
                     .iter()
-                    .map(|t| TrackMix { mute: false, solo: false, volume: t.volume as f32 / 127.0, tone: t.default_tone() })
+                    .map(|t| TrackMix { mute: false, solo: false, volume: t.volume as f32 / 127.0, tone: t.default_tone_with_nam(self.nam_path.is_some()) })
                     .collect();
                 let tones: Vec<ToneKind> = mix.iter().map(|m| m.tone).collect();
                 let sched = Arc::new(build_schedule(&song, &tones));
