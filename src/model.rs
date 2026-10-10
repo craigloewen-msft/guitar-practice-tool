@@ -51,17 +51,25 @@ pub enum ToneKind {
     Clean,
     Crunch,
     HighGain,
+    /// Crunch / distortion from the DI guitar through the built-in amp simulator.
+    CrunchAmp,
+    HighGainAmp,
+    /// Picked bass.
     Bass,
+    FingerBass,
     Drums,
 }
 
 impl ToneKind {
-    pub const ALL_GUITAR: [ToneKind; 4] = [
-        ToneKind::Acoustic,
-        ToneKind::Clean,
-        ToneKind::Crunch,
+    pub const ALL_GUITAR: [ToneKind; 6] = [
         ToneKind::HighGain,
+        ToneKind::Crunch,
+        ToneKind::HighGainAmp,
+        ToneKind::CrunchAmp,
+        ToneKind::Clean,
+        ToneKind::Acoustic,
     ];
+    pub const ALL_BASS: [ToneKind; 2] = [ToneKind::Bass, ToneKind::FingerBass];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -69,9 +77,16 @@ impl ToneKind {
             ToneKind::Clean => "Clean",
             ToneKind::Crunch => "Crunch",
             ToneKind::HighGain => "Distortion",
-            ToneKind::Bass => "Bass",
+            ToneKind::CrunchAmp => "Crunch (amp sim)",
+            ToneKind::HighGainAmp => "Distortion (amp sim)",
+            ToneKind::Bass => "Bass (pick)",
+            ToneKind::FingerBass => "Bass (finger)",
             ToneKind::Drums => "Drums",
         }
+    }
+
+    pub fn is_bass(self) -> bool {
+        matches!(self, ToneKind::Bass | ToneKind::FingerBass)
     }
 }
 
@@ -102,6 +117,7 @@ impl Track {
             24 | 25 => ToneKind::Acoustic,
             29 => ToneKind::Crunch,
             30 => ToneKind::HighGain,
+            33 => ToneKind::FingerBass,
             32..=39 => ToneKind::Bass,
             _ => {
                 if self.strings.len() <= 5 && self.strings.iter().all(|&p| p < 50) {

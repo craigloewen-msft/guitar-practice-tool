@@ -76,7 +76,7 @@ fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(|s| s.as_str())
 }
 
-/// Offline render: `--render <song> <out.wav> [--speed 0.5] [--solo N] [--start-measure M] [--seconds S]`
+/// Offline render: `--render <song> <out.wav> [--speed 0.5] [--solo N] [--start-measure M] [--seconds S] [--tone T] [--synth]`
 fn render(args: &[String]) -> anyhow::Result<()> {
     use std::sync::Arc;
     use synth::{Command, Engine, Shared};
@@ -86,7 +86,16 @@ fn render(args: &[String]) -> anyhow::Result<()> {
     let seconds: f64 = arg_value(args, "--seconds").map(|s| s.parse()).transpose()?.unwrap_or(20.0);
     let start_measure: usize = arg_value(args, "--start-measure").map(|s| s.parse()).transpose()?.unwrap_or(1);
     let sr = 48000u32;
-    let tones: Vec<_> = song.tracks.iter().map(|t| t.default_tone()).collect();
+    let mut tones: Vec<_> = song.tracks.iter().map(|t| t.default_tone()).collect();
+    if let Some(name) = arg_value(args, "--tone") {
+        let k = model::ToneKind::ALL_GUITAR
+            .into_iter()
+            .find(|k| k.label().to_lowercase().replace(' ', "") == name.to_lowercase())
+            .ok_or_else(|| anyhow::anyhow!("unknown tone {name}"))?;
+        for t in tones.iter_mut().filter(|t| !t.is_bass() && **t != model::ToneKind::Drums) {
+            *t = k;
+        }
+    }
     let sched = Arc::new(timeline::build_schedule(&song, &tones));
     let start_tick = sched
         .timeline
@@ -95,6 +104,21 @@ fn render(args: &[String]) -> anyhow::Result<()> {
         .unwrap_or(0);
     let mut engine = Engine::new(sr as f32, Arc::new(Shared::default()), None);
     engine.handle(Command::SetSchedule(sched.clone()));
+    if !args.iter().any(|a| a == "--synth") {
+        let lib = synth::sampler::Library::new();
+        let mut ids: Vec<_> = tones.iter().filter_map(|&t| synth::sampler::BankId::for_tone(t)).collect();
+        ids.dedup();
+        for id in ids {
+            let t = std::time::Instant::now();
+            match lib.load_now(id) {
+                Some(b) => {
+                    println!("loaded {} in {:.2}s ({} MB)", id.label(), t.elapsed().as_secs_f64(), b.memory_bytes() >> 20);
+                    engine.handle(Command::Bank(id, b));
+                }
+                None => println!("bank {} not available, using synth", id.label()),
+            }
+        }
+    }
     if let Some(s) = arg_value(args, "--solo") {
         engine.handle(Command::Solo(s.parse()?, true));
     }

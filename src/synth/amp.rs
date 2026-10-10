@@ -15,10 +15,13 @@ pub struct AmpChain {
     post: Eq,
     out_gain: f32,
     pub reverb_send: f32,
+    /// Plain stereo gain stage (samples that already include amp/cab or acoustic drums).
+    passthrough: bool,
 }
 
 impl AmpChain {
-    pub fn new(tone: ToneKind, sr: f32) -> Self {
+    /// `processed`: the source samples already contain the amplifier sound.
+    pub fn new(tone: ToneKind, sr: f32, processed: bool) -> Self {
         let os = sr * 4.0;
         let aa = || Eq(vec![Biquad::lowpass(os, sr * 0.42, 0.54), Biquad::lowpass(os, sr * 0.42, 1.31)]);
         let mut chain = AmpChain {
@@ -32,9 +35,19 @@ impl AmpChain {
             post: Eq::default(),
             out_gain: 1.0,
             reverb_send: 0.1,
+            passthrough: false,
         };
+        if processed {
+            chain.passthrough = true;
+            (chain.out_gain, chain.reverb_send) = match tone {
+                ToneKind::Clean => (0.5, 0.22),
+                ToneKind::Drums => (0.5, 0.06),
+                _ => (0.42, 0.07),
+            };
+            return chain;
+        }
         match tone {
-            ToneKind::HighGain => {
+            ToneKind::HighGain | ToneKind::HighGainAmp => {
                 chain.pre = Eq(vec![
                     Biquad::highpass(sr, 130.0, 0.7),
                     Biquad::peaking(sr, 750.0, 0.8, 7.0),
@@ -54,7 +67,7 @@ impl AmpChain {
                 chain.out_gain = 0.32;
                 chain.reverb_send = 0.08;
             }
-            ToneKind::Crunch => {
+            ToneKind::Crunch | ToneKind::CrunchAmp => {
                 chain.pre = Eq(vec![
                     Biquad::highpass(sr, 100.0, 0.7),
                     Biquad::peaking(sr, 900.0, 0.8, 5.0),
@@ -86,7 +99,7 @@ impl AmpChain {
                 chain.out_gain = 0.55;
                 chain.reverb_send = 0.25;
             }
-            ToneKind::Bass => {
+            ToneKind::Bass | ToneKind::FingerBass => {
                 chain.pre = Eq(vec![Biquad::highpass(sr, 32.0, 0.7), Biquad::lowshelf(sr, 120.0, 3.0)]);
                 chain.gain = 1.6;
                 chain.bias = 0.05;
@@ -139,6 +152,17 @@ impl AmpChain {
             x
         };
         self.post.process(y) * self.out_gain
+    }
+
+    /// Stereo in/out; amp-simulated chains are mono internally.
+    #[inline]
+    pub fn process_stereo(&mut self, l: f32, r: f32) -> (f32, f32) {
+        if self.passthrough {
+            (l * self.out_gain, r * self.out_gain)
+        } else {
+            let y = self.process(0.5 * (l + r));
+            (y, y)
+        }
     }
 
     pub fn reset(&mut self) {

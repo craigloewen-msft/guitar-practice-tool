@@ -11,6 +11,7 @@ use egui::{Align, Color32, Key, Modifiers, RichText, Sense, Ui, vec2};
 use crate::audio::AudioOut;
 use crate::model::{Song, ToneKind};
 use crate::synth::Command;
+use crate::synth::sampler::{BankId, Library, SlotState};
 use crate::timeline::{Schedule, build_schedule};
 use tab::{Paint, TabLayout};
 
@@ -34,7 +35,10 @@ pub struct App {
     audio_error: Option<String>,
     error: Option<String>,
     view_track: usize,
-    speed_pct: u32,
+    /// Playback speed relative to the score tempo.
+    speed: f64,
+    library: Arc<Library>,
+    ctx: egui::Context,
     metronome: bool,
     count_in: bool,
     master: f32,
@@ -50,7 +54,7 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> App {
-        cc.egui_ctx.set_visuals(egui::Visuals::light());
+        cc.egui_ctx.set_visuals(dark_visuals());
         let (audio, audio_error) = match AudioOut::start() {
             Ok(a) => (Some(a), None),
             Err(e) => (None, Some(format!("Audio unavailable: {e:#}"))),
@@ -61,7 +65,9 @@ impl App {
             audio_error,
             error: None,
             view_track: 0,
-            speed_pct: 100,
+            speed: 1.0,
+            library: Library::new(),
+            ctx: cc.egui_ctx.clone(),
             metronome: false,
             count_in: false,
             master: 0.8,
@@ -86,6 +92,45 @@ impl App {
         }
     }
 
+    /// Start loading the sound bank for a tone in the background (no-op if already requested).
+    fn request_bank(&self, tone: ToneKind) {
+        let (Some(id), Some(audio)) = (BankId::for_tone(tone), &self.audio) else { return };
+        let tx = audio.tx.clone();
+        let ctx = self.ctx.clone();
+        self.library.request(id, move |bank| {
+            let _ = tx.send(Command::Bank(id, bank));
+            ctx.request_repaint();
+        });
+        self.ctx.request_repaint_after(std::time::Duration::from_millis(200));
+    }
+
+    fn sound_status(&self) -> Option<(String, bool)> {
+        let l = self.loaded.as_ref()?;
+        let mut loading = Vec::new();
+        let mut missing = Vec::new();
+        for m in &l.mix {
+            let Some(id) = BankId::for_tone(m.tone) else { continue };
+            match self.library.state(id) {
+                SlotState::Loading | SlotState::Unrequested => loading.push(id.label()),
+                SlotState::Missing | SlotState::Failed(_) => missing.push(id.label()),
+                SlotState::Ready => {}
+            }
+        }
+        loading.dedup();
+        missing.dedup();
+        if !loading.is_empty() {
+            Some((format!("Loading sounds: {}…", loading.join(", ")), false))
+        } else if !missing.is_empty() {
+            Some((format!("Sound bank not found ({}), using built-in synth. Run scripts/fetch-sounds.sh", missing.join(", ")), true))
+        } else {
+            None
+        }
+    }
+
+    fn orig_bpm(&self) -> f64 {
+        self.loaded.as_ref().map(|l| l.song.tempo as f64).filter(|&t| t > 0.0).unwrap_or(120.0)
+    }
+
     fn open(&mut self, path: &Path) {
         match crate::gp::load_file(path) {
             Ok(song) => {
@@ -105,6 +150,9 @@ impl App {
                     self.send(Command::Volume(i, m.volume));
                 }
                 self.send(Command::Loop(None));
+                for m in &mix {
+                    self.request_bank(m.tone);
+                }
                 // Default view: first non-drum track.
                 self.view_track = song.tracks.iter().position(|t| !t.percussion).unwrap_or(0);
                 self.loaded = Some(Loaded { path: path.to_path_buf(), song, sched, mix });
@@ -144,9 +192,15 @@ impl App {
         }
     }
 
-    fn set_speed(&mut self, pct: u32) {
-        self.speed_pct = pct.clamp(10, 200);
-        self.send(Command::Speed(self.speed_pct as f64 / 100.0));
+    fn set_bpm(&mut self, bpm: f64) {
+        let orig = self.orig_bpm();
+        let bpm = bpm.round().clamp((orig * 0.1).ceil(), (orig * 2.0).floor());
+        self.speed = bpm / orig;
+        self.send(Command::Speed(self.speed));
+    }
+
+    fn target_bpm(&self) -> f64 {
+        (self.orig_bpm() * self.speed).round()
     }
 
     /// Playback tick for a score measure + offset, choosing the repeat pass nearest the cursor.
@@ -241,7 +295,7 @@ impl App {
             self.toggle_play();
         }
         if speed_delta != 0 {
-            self.set_speed((self.speed_pct as i32 + speed_delta).max(10) as u32);
+            self.set_bpm(self.target_bpm() + speed_delta as f64);
         }
         if measure_delta != 0 {
             if let Some((m, _)) = self.current_measure() {
@@ -307,16 +361,27 @@ impl App {
                 self.follow = true;
             }
             ui.separator();
-            ui.label("Speed");
-            let mut sp = self.speed_pct;
-            let resp = ui.add(egui::Slider::new(&mut sp, 25..=150).suffix("%").step_by(5.0));
-            if resp.changed() {
-                self.set_speed(sp);
+            ui.label("Tempo");
+            let orig = self.orig_bpm();
+            let mut bpm = self.target_bpm();
+            let lo = (orig * 0.25).round().max(10.0);
+            let hi = (orig * 1.5).round();
+            let resp = ui.add_enabled(
+                self.loaded.is_some(),
+                egui::Slider::new(&mut bpm, lo..=hi).suffix(" BPM").step_by(1.0).max_decimals(0),
+            );
+            if resp.on_hover_text("Playback tempo (+ / − keys)").changed() {
+                self.set_bpm(bpm);
             }
-            for p in [50u32, 75, 100] {
-                if ui.selectable_label(self.speed_pct == p, format!("{p}%")).clicked() {
-                    self.set_speed(p);
-                }
+            let changed = (self.speed - 1.0).abs() > 1e-6;
+            let orig_text = RichText::new(format!("Original {orig:.0}"));
+            ui.label(if changed { orig_text.color(ui.visuals().warn_fg_color) } else { orig_text.weak() });
+            if ui
+                .add_enabled(changed, egui::Button::new("↺ Reset"))
+                .on_hover_text(format!("Back to the original {orig:.0} BPM"))
+                .clicked()
+            {
+                self.set_bpm(orig);
             }
             ui.separator();
             if ui.toggle_value(&mut self.metronome, "🕑 Metronome").on_hover_text("M").changed() {
@@ -344,7 +409,7 @@ impl App {
         let Some(l) = &self.loaded else { return };
         let tl = &l.sched.timeline;
         let pos = self.pos();
-        let speed = self.speed_pct as f64 / 100.0;
+        let speed = self.speed;
         let t = tl.seconds_at(pos) / speed;
         let total = tl.seconds_at(tl.total as f64) / speed;
         let fmt = |s: f64| format!("{}:{:02}", (s / 60.0) as u32, (s % 60.0) as u32);
@@ -356,13 +421,22 @@ impl App {
             ui.label(format!("Bar {bar} / {}", l.song.measure_headers.len()));
             ui.separator();
             ui.label(format!("♩ = {:.0}", bpm * speed));
-            if self.speed_pct != 100 {
-                ui.label(RichText::new(format!("({:.0} × {}%)", bpm, self.speed_pct)).weak());
+            if (speed - 1.0).abs() > 1e-6 {
+                ui.label(RichText::new(format!("(score {:.0}, {:.0}%)", bpm, speed * 100.0)).weak());
             }
             if self.loop_on {
                 if let Some((a, b)) = self.selection {
                     ui.separator();
-                    ui.label(RichText::new(format!("Looping bars {}–{}", a + 1, b + 1)).color(Color32::from_rgb(30, 110, 200)));
+                    ui.label(RichText::new(format!("Looping bars {}–{}", a + 1, b + 1)).color(Color32::from_rgb(110, 170, 255)));
+                }
+            }
+            if let Some((msg, warn)) = self.sound_status() {
+                ui.separator();
+                if warn {
+                    ui.colored_label(ui.visuals().warn_fg_color, msg);
+                } else {
+                    ui.spinner();
+                    ui.label(RichText::new(msg).weak());
                 }
             }
             if let Some(e) = &self.audio_error {
@@ -387,7 +461,7 @@ impl App {
             let m = &mut l.mix[i];
             let selected = self.view_track == i;
             let frame = egui::Frame::new()
-                .fill(if selected { Color32::from_rgb(225, 236, 252) } else { Color32::TRANSPARENT })
+                .fill(if selected { Color32::from_rgb(44, 52, 66) } else { Color32::TRANSPARENT })
                 .corner_radius(6.0)
                 .inner_margin(6.0);
             let resp = frame
@@ -424,11 +498,12 @@ impl App {
                                 cmds.push(Command::Volume(i, m.volume));
                             }
                         });
-                        if !t.percussion && m.tone != ToneKind::Bass {
+                        if !t.percussion {
+                                let choices: &[ToneKind] = if m.tone.is_bass() { &ToneKind::ALL_BASS } else { &ToneKind::ALL_GUITAR };
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("Tone").small());
                                 egui::ComboBox::from_id_salt(("tone", i)).selected_text(m.tone.label()).show_ui(ui, |ui| {
-                                    for k in ToneKind::ALL_GUITAR {
+                                    for &k in choices {
                                         if ui.selectable_value(&mut m.tone, k, k.label()).changed() {
                                             cmds.push(Command::Tone(i, k));
                                         }
@@ -457,7 +532,7 @@ impl App {
             ("Drag", "select bars"),
             ("L / Esc", "loop / clear"),
             ("← →", "prev / next bar"),
-            ("+ / −", "speed ±5%"),
+            ("+ / −", "tempo ±5 BPM"),
             ("M", "metronome"),
             ("1–9", "switch track"),
         ] {
@@ -471,6 +546,9 @@ impl App {
             ui.label(RichText::new(p.to_string_lossy()).small().weak());
         }
         for c in cmds {
+            if let Command::Tone(_, k) = c {
+                self.request_bank(k);
+            }
             self.send(c);
         }
     }
@@ -647,4 +725,16 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
+}
+
+/// Dark theme tuned for long practice sessions.
+fn dark_visuals() -> egui::Visuals {
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = Color32::from_rgb(28, 31, 36);
+    v.window_fill = Color32::from_rgb(32, 35, 41);
+    v.extreme_bg_color = Color32::from_rgb(20, 22, 26);
+    v.faint_bg_color = Color32::from_rgb(36, 40, 46);
+    v.selection.bg_fill = Color32::from_rgb(52, 92, 150);
+    v.hyperlink_color = Color32::from_rgb(110, 170, 255);
+    v
 }

@@ -4,5 +4,5 @@
 *.gp4
 *.gp5
 *.gpx
-/assets/*.sf2
-/assets/*.sf3
+/assets/*
+!/assets/.gitkeep

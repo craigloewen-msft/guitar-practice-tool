@@ -17,12 +17,12 @@ const LANE_TEXT: f32 = 10.0;
 const LANE_ORN: f32 = 27.0;
 const LANE_PM: f32 = 42.0;
 
-pub const BG: Color32 = Color32::from_rgb(255, 255, 255);
-const INK: Color32 = Color32::from_rgb(34, 34, 34);
-const LINE: Color32 = Color32::from_rgb(160, 160, 160);
-const SOFT: Color32 = Color32::from_rgb(130, 130, 130);
-const ACCENT: Color32 = Color32::from_rgb(214, 66, 40);
-const MARKER: Color32 = Color32::from_rgb(30, 110, 200);
+pub const BG: Color32 = Color32::from_rgb(24, 26, 31);
+const INK: Color32 = Color32::from_rgb(222, 225, 230);
+const LINE: Color32 = Color32::from_rgb(78, 84, 94);
+const SOFT: Color32 = Color32::from_rgb(140, 146, 156);
+const ACCENT: Color32 = Color32::from_rgb(255, 120, 70);
+const MARKER: Color32 = Color32::from_rgb(110, 170, 255);
 
 const F_PM: u8 = 1;
 const F_LR: u8 = 2;
@@ -401,9 +401,9 @@ impl Paint<'_> {
                 if mi >= a && mi <= b {
                     let m = &lay.meas[mi];
                     let color = if self.loop_active {
-                        Color32::from_rgba_unmultiplied(80, 150, 255, 40)
+                        Color32::from_rgba_unmultiplied(80, 150, 255, 45)
                     } else {
-                        Color32::from_rgba_unmultiplied(120, 120, 120, 30)
+                        Color32::from_rgba_unmultiplied(160, 170, 190, 28)
                     };
                     painter.rect_filled(
                         Rect::from_min_max(self.p(m.x, top - 18.0), self.p(m.x + m.w, bottom + 30.0)),
@@ -467,7 +467,7 @@ impl Paint<'_> {
             if lay.meas.get(cm).map(|m| m.row) == Some(ri) {
                 let x = lay.x_at(cm, rel);
                 let rect = Rect::from_min_max(self.p(x - 9.0, top - 10.0), self.p(x + 9.0, bottom + 10.0));
-                painter.rect_filled(rect, 3.0, Color32::from_rgba_unmultiplied(255, 120, 40, 38));
+                painter.rect_filled(rect, 3.0, Color32::from_rgba_unmultiplied(255, 120, 40, 45));
                 painter.line_segment([self.p(x, top - 10.0), self.p(x, bottom + 10.0)], Stroke::new(2.0, ACCENT));
             }
         }
@@ -673,7 +673,7 @@ impl Paint<'_> {
                     };
                 }
                 if r.voice > 0 {
-                    color = Color32::from_rgb(110, 90, 160);
+                    color = Color32::from_rgb(180, 160, 230);
                 }
                 self.knockout_text(painter, self.p(x, y), text, 12.5, color);
                 if n.accent || n.heavy_accent {
