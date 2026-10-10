@@ -1,0 +1,8 @@
+/target
+# Song files and downloaded sound assets stay local
+*.gp3
+*.gp4
+*.gp5
+*.gpx
+/assets/*.sf2
+/assets/*.sf3
