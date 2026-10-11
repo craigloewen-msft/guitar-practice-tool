@@ -785,8 +785,9 @@ mod tests {
             return;
         };
         let model = NamModel::load(&path).unwrap();
-        for stereo in [false, true] {
-            let mut chain = crate::synth::amp::AmpChain::with_nam(&model, 48000.0, stereo);
+        use crate::model::ToneKind;
+        for (tone, stereo) in [(ToneKind::Clean, false), (ToneKind::Nam, false), (ToneKind::Nam, true)] {
+            let mut chain = crate::synth::amp::AmpChain::with_nam(&model, 48000.0, tone, stereo);
             let (mut energy, mut peak) = (0.0f64, 0.0f32);
             for b in 0..60 {
                 let mut l: Vec<f32> =
@@ -799,8 +800,8 @@ mod tests {
                     peak = peak.max(y.abs());
                 }
             }
-            assert!(energy > 1.0, "stereo={stereo}: NAM chain output is silent");
-            assert!(peak < 4.0, "stereo={stereo}: NAM chain output level runaway ({peak})");
+            assert!(energy > 1.0, "{tone:?} stereo={stereo}: NAM chain output is silent");
+            assert!(peak < 4.0, "{tone:?} stereo={stereo}: NAM chain output level runaway ({peak})");
         }
     }
 }

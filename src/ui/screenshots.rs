@@ -22,7 +22,7 @@ fn harness(path: Option<PathBuf>) -> Harness<'static, App> {
         .build_eframe(move |cc| App::new(cc, path))
 }
 
-fn test_song() -> Option<PathBuf> {
+pub(crate) fn test_song() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("GPT_SHOT_SONG") {
         return Some(p.into());
     }

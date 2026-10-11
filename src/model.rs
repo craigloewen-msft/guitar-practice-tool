@@ -47,9 +47,9 @@ impl MeasureHeader {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToneKind {
-    Acoustic,
+    /// Guitar into the Neural Amp Modeler capture with the input turned down.
     Clean,
-    /// DI guitar double-tracked through a Neural Amp Modeler capture.
+    /// Guitar double-tracked and driven hard into the Neural Amp Modeler capture.
     Nam,
     /// Picked bass.
     Bass,
@@ -58,22 +58,17 @@ pub enum ToneKind {
 }
 
 impl ToneKind {
-    pub const ALL_GUITAR: [ToneKind; 3] = [ToneKind::Nam, ToneKind::Clean, ToneKind::Acoustic];
+    pub const ALL_GUITAR: [ToneKind; 2] = [ToneKind::Nam, ToneKind::Clean];
     pub const ALL_BASS: [ToneKind; 2] = [ToneKind::Bass, ToneKind::FingerBass];
 
     pub fn label(self) -> &'static str {
         match self {
-            ToneKind::Acoustic => "Acoustic",
-            ToneKind::Clean => "Clean",
-            ToneKind::Nam => "NAM amp",
+            ToneKind::Clean => "NAM clean",
+            ToneKind::Nam => "NAM drive",
             ToneKind::Bass => "Bass (pick)",
             ToneKind::FingerBass => "Bass (finger)",
             ToneKind::Drums => "Drums",
         }
-    }
-
-    pub fn is_distorted(self) -> bool {
-        self == ToneKind::Nam
     }
 
     pub fn is_bass(self) -> bool {
@@ -100,13 +95,12 @@ pub struct Track {
 }
 
 impl Track {
-    /// Default tone, preferring the neural amp for distorted parts when a capture is installed.
+    /// Default tone: overdriven / distortion guitar programs get the driven amp.
     pub fn default_tone(&self) -> ToneKind {
         if self.percussion {
             return ToneKind::Drums;
         }
         match self.program {
-            24 | 25 => ToneKind::Acoustic,
             29 | 30 => ToneKind::Nam,
             33 => ToneKind::FingerBass,
             32..=39 => ToneKind::Bass,

@@ -1,4 +1,5 @@
-//! Sample-based instruments loaded from SoundFont (SF2) banks.
+//! Sample-based bass and drums loaded from SoundFont (SF2) banks. Guitars are not sampled:
+//! they are synthesized strings played through the neural amp model.
 //!
 //! `rustysynth` is used only to parse the SF2 file. Playback is a custom voice so that the
 //! existing note events (bends, slides, vibrato, legato, palm mutes, dead notes) map onto
@@ -24,22 +25,13 @@ pub const MAX_LAYERS: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum BankId {
-    GuitarDirect,
-    /// Humbucker DI with real palm-muted takes (low/mid notes) + FreePats DI (high notes).
-    GuitarHybridDi,
     BassFinger,
     BassPicked,
     Drums,
 }
 
 impl BankId {
-    pub const ALL: [BankId; 5] = [
-        BankId::GuitarDirect,
-        BankId::GuitarHybridDi,
-        BankId::BassFinger,
-        BankId::BassPicked,
-        BankId::Drums,
-    ];
+    pub const ALL: [BankId; 3] = [BankId::BassFinger, BankId::BassPicked, BankId::Drums];
     pub const COUNT: usize = Self::ALL.len();
 
     pub fn index(self) -> usize {
@@ -49,7 +41,6 @@ impl BankId {
     /// The SF2 file name starts with this prefix (FreePats release naming).
     pub fn file_prefix(self) -> &'static str {
         match self {
-            BankId::GuitarDirect | BankId::GuitarHybridDi => "EGuitarFSBS-direct",
             BankId::BassFinger => "FingerBassYR",
             BankId::BassPicked => "PickedBassYR",
             BankId::Drums => "MuldjordKit",
@@ -58,19 +49,16 @@ impl BankId {
 
     pub fn label(self) -> &'static str {
         match self {
-            BankId::GuitarDirect => "electric guitar (DI)",
-            BankId::GuitarHybridDi => "humbucker guitar (DI)",
             BankId::BassFinger => "finger bass",
             BankId::BassPicked => "picked bass",
             BankId::Drums => "drum kit",
         }
     }
 
-    /// Sound bank used by a track tone (`None`: synthesized).
+    /// Sound bank used by a track tone (`None`: synthesized, e.g. guitars into the amp model).
     pub fn for_tone(tone: ToneKind) -> Option<BankId> {
         Some(match tone {
-            ToneKind::Clean | ToneKind::Acoustic => BankId::GuitarDirect,
-            ToneKind::Nam => BankId::GuitarHybridDi,
+            ToneKind::Clean | ToneKind::Nam => return None,
             ToneKind::Bass => BankId::BassPicked,
             ToneKind::FingerBass => BankId::BassFinger,
             ToneKind::Drums => BankId::Drums,
@@ -82,7 +70,6 @@ impl BankId {
         match self {
             BankId::BassFinger | BankId::BassPicked => 0.75,
             BankId::Drums => 2.4,
-            BankId::GuitarDirect | BankId::GuitarHybridDi => 1.0,
         }
     }
 
@@ -105,15 +92,7 @@ struct Zone {
     rate: f32,
     gl: f32,
     gr: f32,
-    /// Recorded palm-muted take.
-    muted: bool,
 }
-
-/// Highest key served by the humbucker recordings for open notes in the hybrid DI bank;
-/// above this the FreePats DI samples are used (less pitch shifting).
-const HYBRID_SPLIT: u8 = 62;
-const HB_NOTES: [(&str, u8, u8, u8); 6] =
-    [("G#1", 32, 0, 38), ("D#2", 39, 39, 43), ("G#2", 44, 44, 48), ("C#3", 49, 49, 52), ("F3", 53, 53, 57), ("A#3", 58, 58, 127)];
 
 pub struct Bank {
     pub id: BankId,
@@ -125,10 +104,6 @@ pub struct Bank {
     nearest: Vec<u8>,
     /// Gain that brings the loudest sample in the bank to roughly full scale.
     pub norm: f32,
-    /// Has recorded palm-muted samples.
-    pub has_muted: bool,
-    /// Matching zones are round-robin alternatives (pick one) rather than layers.
-    round_robin: bool,
 }
 
 impl Bank {
@@ -191,17 +166,16 @@ impl Bank {
                     rate,
                     gl: gain * (1.0 - pan).min(1.0),
                     gr: gain * (1.0 + pan).min(1.0),
-                    muted: false,
                 });
             }
         }
         if zones.is_empty() {
             return Err(anyhow!("{}: no playable regions", path.display()));
         }
-        Ok(Bank::finish(id, data, zones, false))
+        Ok(Bank::finish(id, data, zones))
     }
 
-    fn finish(id: BankId, mut data: Vec<i16>, zones: Vec<Zone>, round_robin: bool) -> Bank {
+    fn finish(id: BankId, mut data: Vec<i16>, zones: Vec<Zone>) -> Bank {
         data.shrink_to_fit();
         let mut by_key: Vec<Vec<u32>> = vec![Vec::new(); 128];
         for (i, z) in zones.iter().enumerate() {
@@ -218,100 +192,7 @@ impl Bank {
             })
             .collect();
         let peak = data.iter().map(|&s| (s as i32).unsigned_abs()).max().unwrap_or(1).max(1) as f32 / 32768.0;
-        let has_muted = zones.iter().any(|z| z.muted);
-        Bank { id, data, zones, by_key, nearest, norm: 0.9 / peak, has_muted, round_robin }
-    }
-
-    /// Humbucker DI recordings (`humbucker-di/<note>_<rr>_<vel>[_muted].wav`) for low and
-    /// palm-muted notes, plus the FreePats DI SF2 for high open notes. Keeps the DI level
-    /// realistic (not normalised) because it drives an amp model.
-    pub fn load_hybrid(hb_dir: &Path, sf2: &Path) -> Result<Bank> {
-        let fp = Bank::load(BankId::GuitarDirect, sf2)?;
-        let mut data: Vec<i16> = Vec::new();
-        let mut zones = Vec::new();
-        // Humbucker samples are 24-bit with peaks around 0.2-0.45; store them as i16 scaled by 2.
-        const HB_SCALE: f32 = 2.0;
-        for &(note, root, lo, hi) in &HB_NOTES {
-            for muted in [false, true] {
-                for vel in 1..=2u8 {
-                    for rr in 1..=4u8 {
-                        let f = hb_dir.join(format!("{note}_{rr}_{vel}{}.wav", if muted { "_muted" } else { "" }));
-                        let (samples, rate) = read_wav_mono(&f)?;
-                        let max = (MAX_SECS * rate) as usize;
-                        let len = samples.len().min(max);
-                        data.extend(std::iter::repeat_n(0, PAD_BEFORE));
-                        let start = data.len();
-                        let fade = ((FADE_SECS * rate) as usize).min(len);
-                        for (i, &x) in samples[..len].iter().enumerate() {
-                            let g = if samples.len() > max && i >= len - fade {
-                                let u = 1.0 - (i + 1 - (len - fade)) as f32 / fade as f32;
-                                u * u
-                            } else {
-                                1.0
-                            };
-                            data.push((x * HB_SCALE * g * 32767.0).clamp(-32767.0, 32767.0) as i16);
-                        }
-                        data.extend(std::iter::repeat_n(0, PAD_AFTER));
-                        let key_hi = if muted { hi } else { hi.min(HYBRID_SPLIT) };
-                        if lo > key_hi {
-                            continue;
-                        }
-                        let (vel_lo, vel_hi) = if vel == 1 { (0, 95) } else { (96, 127) };
-                        // Hard-picked strings ring 5-30 cents sharp; tune each take.
-                        let seg = if muted { (0.03, 0.15) } else { (0.2, 0.7) };
-                        let cents = measure_cents(&samples, rate, root as f32, seg).unwrap_or(0.0);
-                        zones.push(Zone {
-                            key_lo: lo,
-                            key_hi,
-                            vel_lo,
-                            vel_hi,
-                            root: root as f32 + cents / 100.0,
-                            start,
-                            len,
-                            rate,
-                            gl: 1.0 / HB_SCALE,
-                            gr: 1.0 / HB_SCALE,
-                            muted,
-                        });
-                    }
-                }
-            }
-        }
-        // FreePats DI zones for the high open notes, level-matched to the humbucker at the split.
-        let rms = |d: &[i16], z: &Zone| {
-            let a = z.start + (0.03 * z.rate) as usize;
-            let b = (z.start + (0.5 * z.rate) as usize).min(z.start + z.len);
-            let s: f64 = d[a..b].iter().map(|&x| (x as f64 / 32768.0).powi(2)).sum();
-            (s / (b - a).max(1) as f64).sqrt() as f32
-        };
-        let hb_ref: Vec<f32> = zones
-            .iter()
-            .filter(|z| !z.muted && z.key_hi == HYBRID_SPLIT && z.vel_lo >= 96)
-            .map(|z| rms(&data, z) * z.gl)
-            .collect();
-        let mut fp_ids = [0u32; MAX_LAYERS];
-        let n = fp.find(HYBRID_SPLIT as i32, 110, false, 0, &mut fp_ids);
-        let fp_ref: f32 = fp_ids[..n].iter().map(|&zi| rms(&fp.data, &fp.zones[zi as usize]) * fp.zones[zi as usize].gl).sum();
-        let match_gain = if fp_ref > 0.0 && !hb_ref.is_empty() {
-            hb_ref.iter().sum::<f32>() / hb_ref.len() as f32 / fp_ref
-        } else {
-            1.0
-        };
-        let offset = data.len() + PAD_BEFORE;
-        data.extend(std::iter::repeat_n(0, PAD_BEFORE));
-        data.extend_from_slice(&fp.data);
-        for z in fp.zones.iter().filter(|z| z.key_hi > HYBRID_SPLIT) {
-            zones.push(Zone {
-                key_lo: z.key_lo.max(HYBRID_SPLIT + 1),
-                start: z.start + offset,
-                gl: z.gl * match_gain,
-                gr: z.gr * match_gain,
-                ..*z
-            });
-        }
-        let mut bank = Bank::finish(BankId::GuitarHybridDi, data, zones, true);
-        bank.norm = 1.0;
-        Ok(bank)
+        Bank { id, data, zones, by_key, nearest, norm: 0.9 / peak }
     }
 
     pub fn memory_bytes(&self) -> usize {
@@ -319,38 +200,9 @@ impl Bank {
     }
 
     /// Zones for a key/velocity (stereo pairs yield two zones).
-    /// `muted` selects recorded palm-muted takes when the bank has them; `rr` picks one
-    /// round-robin alternative in round-robin banks.
-    fn find(&self, key: i32, vel: i32, muted: bool, rr: u32, out: &mut [u32; MAX_LAYERS]) -> usize {
-        let mut all = [0u32; 16];
-        let n = self.find_layers(key, vel, muted && self.has_muted, &mut all);
-        if self.round_robin && n > 1 {
-            out[0] = all[rr as usize % n];
-            return 1;
-        }
-        let n = n.min(MAX_LAYERS);
-        out[..n].copy_from_slice(&all[..n]);
-        n
-    }
-
-    fn find_layers(&self, key: i32, vel: i32, muted: bool, out: &mut [u32]) -> usize {
+    fn find(&self, key: i32, vel: i32, out: &mut [u32; MAX_LAYERS]) -> usize {
         let k = self.nearest[key.clamp(0, 127) as usize] as usize;
-        let all = &self.by_key[k];
-        let mut list = [0u32; 32];
-        let mut len = 0;
-        for &zi in all.iter().filter(|&&zi| self.zones[zi as usize].muted == muted) {
-            if len < list.len() {
-                list[len] = zi;
-                len += 1;
-            }
-        }
-        if len == 0 {
-            for &zi in all.iter().take(list.len()) {
-                list[len] = zi;
-                len += 1;
-            }
-        }
-        let list = &list[..len];
+        let list = &self.by_key[k];
         let mut n = 0;
         for &zi in list {
             let z = &self.zones[zi as usize];
@@ -411,25 +263,6 @@ pub fn gm_to_kit(key: i32, alt_kick: bool) -> Option<i32> {
     })
 }
 
-/// Per-voice performance variation (used for double-tracked guitars).
-#[derive(Clone, Copy)]
-pub struct Take {
-    /// Round-robin selector.
-    pub rr: u32,
-    pub gl: f32,
-    pub gr: f32,
-    /// Samples before the note sounds.
-    pub delay: u32,
-    /// Semitones.
-    pub detune: f32,
-}
-
-impl Default for Take {
-    fn default() -> Self {
-        Take { rr: 0, gl: 1.0, gr: 1.0, delay: 0, detune: 0.0 }
-    }
-}
-
 #[derive(Clone, Copy, Default)]
 struct Layer {
     zone: u32,
@@ -459,9 +292,6 @@ pub struct SampleVoice {
     lp_a: f32,
     lp: [[f32; 2]; 2],
     vib_phase: f32,
-    /// Playing a recorded palm-muted / dead-note take.
-    real_mute: bool,
-    take: Take,
 }
 
 impl SampleVoice {
@@ -485,8 +315,6 @@ impl SampleVoice {
             lp_a: 0.0,
             lp: [[0.0; 2]; 2],
             vib_phase: 0.0,
-            real_mute: false,
-            take: Take::default(),
         }
     }
 
@@ -503,14 +331,7 @@ impl SampleVoice {
         let one_pole = |fc: f32| (-std::f32::consts::TAU * fc.min(sr * 0.45) / sr).exp();
         let decay = |tau: f32| (-1.0 / (tau * sr)).exp();
         let processed = bank.id.is_processed();
-        if self.real_mute && ev.dead {
-            self.lp_a = one_pole(1200.0);
-            self.sustain_mul = decay(0.04);
-        } else if self.real_mute && ev.palm_mute {
-            // The recording already has the muted attack and decay.
-            self.lp_a = 0.0;
-            self.sustain_mul = decay(0.5);
-        } else if ev.dead {
+        if ev.dead {
             self.lp_a = one_pole(if processed { 900.0 } else { 600.0 });
             self.sustain_mul = decay(0.03);
         } else if ev.palm_mute {
@@ -526,24 +347,13 @@ impl SampleVoice {
         }
     }
 
-    /// Start a note. `key` is the sample key (guitar: MIDI pitch, drums: kit key).
+    /// Start a note. `key` is the sample key (bass: MIDI pitch, drums: kit key).
     #[allow(clippy::too_many_arguments)]
-    pub fn start(
-        &mut self,
-        ev_idx: usize,
-        ev: &NoteEvent,
-        bank: &Bank,
-        key: i32,
-        sr: f32,
-        rng: &mut Rng,
-        age: u64,
-        take: Take,
-    ) -> bool {
+    pub fn start(&mut self, ev_idx: usize, ev: &NoteEvent, bank: &Bank, key: i32, sr: f32, rng: &mut Rng, age: u64) -> bool {
         let jitter = (rng.next() * 6.0).round() as i32;
         let vel = ((ev.velocity * 127.0).round() as i32 + jitter).clamp(1, 127);
         let mut zs = [0u32; MAX_LAYERS];
-        let want_mute = !ev.drum && (ev.palm_mute || ev.dead);
-        let n = bank.find(key, vel, want_mute, take.rr, &mut zs);
+        let n = bank.find(key, vel, &mut zs);
         if n == 0 {
             return false;
         }
@@ -559,9 +369,7 @@ impl SampleVoice {
         self.bank = bank.id.index();
         self.drum = ev.drum;
         self.key = key;
-        self.take = take;
-        self.real_mute = want_mute && zs[..n].iter().all(|&z| bank.zones[z as usize].muted);
-        self.pitch = if ev.drum { 0.0 } else { ev.pitch + ev.curve_at(0.0) + take.detune };
+        self.pitch = if ev.drum { 0.0 } else { ev.pitch + ev.curve_at(0.0) };
         self.vib_phase = 0.0;
         self.lp = [[0.0; 2]; 2];
         self.env = 1.0;
@@ -569,9 +377,6 @@ impl SampleVoice {
         let vel_gain = match bank.id {
             BankId::Drums => 1.0,
             BankId::BassFinger | BankId::BassPicked => ev.velocity.powf(0.9) * 1.2,
-            // Real DI level into an amp model: velocity layers do the work.
-            BankId::GuitarHybridDi => (ev.velocity * 1.25).powf(0.4),
-            _ => (ev.velocity * 1.25).powf(0.7),
         };
         self.gain = bank.norm * bank.id.trim() * vel_gain / (n as f32 / 2.0).max(1.0);
         if ev.drum {
@@ -614,15 +419,8 @@ impl SampleVoice {
 
     #[inline]
     pub fn process(&mut self, ev: &NoteEvent, rel_ticks: f64, sr: f32, bank: &Bank) -> (f32, f32) {
-        if self.take.delay > 0 {
-            self.take.delay -= 1;
-            if self.state == State::Choked {
-                self.state = State::Idle;
-            }
-            return (0.0, 0.0);
-        }
         if !self.drum {
-            let mut target = ev.pitch + ev.curve_at(rel_ticks.max(0.0)) + self.take.detune;
+            let mut target = ev.pitch + ev.curve_at(rel_ticks.max(0.0));
             if let Some((vstart, depth)) = ev.vibrato {
                 if rel_ticks >= vstart as f64 {
                     self.vib_phase += 5.5 / sr;
@@ -695,7 +493,7 @@ impl SampleVoice {
             self.env = 0.0;
         }
         let g = self.env.max(0.0) * self.gain;
-        (l * g * self.take.gl, r * g * self.take.gr)
+        (l * g, r * g)
     }
 }
 
@@ -727,14 +525,6 @@ impl Library {
         self.dirs.iter().find_map(|d| find_sf2(d, id.file_prefix(), 3))
     }
 
-    fn find_humbucker_dir(&self) -> Option<PathBuf> {
-        self.dirs.iter().map(|d| d.join("humbucker-di")).find(|d| d.join("A#3_4_2_muted.wav").is_file())
-    }
-
-    pub fn has_humbucker(&self) -> bool {
-        self.find_humbucker_dir().is_some()
-    }
-
     /// Forget banks that were missing so they are looked up again (after a download).
     pub fn rescan(&self) {
         for s in self.state.lock().unwrap().iter_mut() {
@@ -747,13 +537,7 @@ impl Library {
     /// `Err(None)`: files not installed.
     fn load_bank(&self, id: BankId) -> std::result::Result<Bank, Option<String>> {
         let sf2 = self.find_file(id).ok_or(None)?;
-        let r = if id == BankId::GuitarHybridDi {
-            let hb = self.find_humbucker_dir().ok_or(None)?;
-            Bank::load_hybrid(&hb, &sf2)
-        } else {
-            Bank::load(id, &sf2)
-        };
-        r.map_err(|e| Some(e.to_string()))
+        Bank::load(id, &sf2).map_err(|e| Some(e.to_string()))
     }
 
     pub fn state(&self, id: BankId) -> SlotState {
@@ -798,42 +582,6 @@ impl Library {
             }
         }
     }
-}
-
-/// Tuning of a recorded note relative to `midi`, in cents, measured by autocorrelation
-/// over the time window `seg` (seconds). `None` if the estimate is implausible.
-fn measure_cents(x: &[f32], rate: f32, midi: f32, seg: (f32, f32)) -> Option<f32> {
-    let a = (seg.0 * rate) as usize;
-    let b = ((seg.1 * rate) as usize).min(x.len());
-    let x = x.get(a..b)?;
-    let lag0 = rate / midi_to_hz(midi);
-    let (lo, hi) = ((lag0 * 0.95) as usize, (lag0 * 1.05) as usize + 1);
-    if x.len() < hi * 2 {
-        return None;
-    }
-    let ac: Vec<f64> = (lo..=hi).map(|l| x[..x.len() - l].iter().zip(&x[l..]).map(|(&p, &q)| (p * q) as f64).sum()).collect();
-    let i = (1..ac.len() - 1).max_by(|&i, &j| ac[i].total_cmp(&ac[j]))?;
-    let (p, q, r) = (ac[i - 1], ac[i], ac[i + 1]);
-    let den = p - 2.0 * q + r;
-    let frac = if den.abs() > 1e-12 { 0.5 * (p - r) / den } else { 0.0 };
-    let lag = lo as f64 + i as f64 + frac;
-    let cents = (1200.0 * (lag0 as f64 / lag).log2()) as f32;
-    (cents.abs() < 60.0).then_some(cents)
-}
-
-/// Read a WAV file as mono f32 (first channel).
-fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, f32)> {
-    let mut r = hound::WavReader::open(path).with_context(|| format!("open {}", path.display()))?;
-    let spec = r.spec();
-    let ch = spec.channels.max(1) as usize;
-    let x: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => r.samples::<f32>().step_by(ch).collect::<Result<_, _>>()?,
-        hound::SampleFormat::Int => {
-            let scale = 1.0 / (1u64 << (spec.bits_per_sample - 1)) as f32;
-            r.samples::<i32>().step_by(ch).map(|s| s.map(|v| v as f32 * scale)).collect::<Result<_, _>>()?
-        }
-    };
-    Ok((x, spec.sample_rate as f32))
 }
 
 pub(crate) fn search_dirs() -> Vec<PathBuf> {
@@ -886,7 +634,7 @@ mod tests {
         let sr = 48000.0;
         let mut v = SampleVoice::new();
         let mut rng = Rng::new(1);
-        assert!(v.start(0, ev, bank, ev.pitch as i32, sr, &mut rng, 0, Take::default()));
+        assert!(v.start(0, ev, bank, ev.pitch as i32, sr, &mut rng, 0));
         (0..(secs * sr) as usize).map(|i| {
             let (l, r) = v.process(ev, i as f64 * 0.04, sr, bank);
             0.5 * (l + r)
@@ -897,17 +645,18 @@ mod tests {
     #[test]
     fn sampled_pitch_and_palm_mute() {
         let lib = Library::new();
-        for id in [BankId::GuitarDirect, BankId::BassFinger] {
+        for id in [BankId::BassFinger, BankId::BassPicked] {
             let Some(bank) = lib.load_now(id) else {
                 eprintln!("skipping: {} bank not installed", id.label());
                 continue;
             };
-            let pitches: &[f32] = if id == BankId::BassFinger { &[28.0, 33.0, 40.0, 50.0] } else { &[40.0, 47.0, 57.0, 64.0, 71.0] };
+            let pitches: &[f32] = &[28.0, 33.0, 40.0, 50.0];
             for &p in pitches {
                 let ev = NoteEvent { end: 100_000, pitch: p, velocity: 0.8, ..Default::default() };
-                let y = render(&bank, &ev, 0.6);
+                let y = render(&bank, &ev, 1.4);
                 assert!(y.iter().all(|s| s.is_finite()));
-                let hz = estimate_hz(&y[(0.15 * 48000.0) as usize..], 48000.0);
+                // Measure after the attack: hard-picked low strings start sharp and settle.
+                let hz = estimate_hz(&y[(0.8 * 48000.0) as usize..], 48000.0);
                 let c = 1200.0 * (hz / midi_to_hz(p)).log2();
                 // allow octave-ambiguous estimates on bass, but the pitch class must be right
                 let c = ((c + 600.0).rem_euclid(1200.0)) - 600.0;
@@ -926,37 +675,6 @@ mod tests {
             assert!(pm_hf < open_hf * 0.5, "{}: palm mute not darker", id.label());
             assert!(pm_tail < open_tail * 0.2, "{}: palm mute not shorter", id.label());
         }
-    }
-
-    /// Runs only when the humbucker DI + FreePats DI are installed.
-    #[test]
-    fn hybrid_di_pitch_and_recorded_palm_mutes() {
-        let Some(bank) = Library::new().load_now(BankId::GuitarHybridDi) else {
-            eprintln!("skipping: humbucker DI not installed");
-            return;
-        };
-        assert!(bank.has_muted);
-        // Both sides of the humbucker / FreePats split.
-        for p in [40.0, 45.0, 52.0, 57.0, 62.0, 64.0, 71.0] {
-            for rr in 0..2 {
-                let ev = NoteEvent { end: 100_000, pitch: p, velocity: 0.8, ..Default::default() };
-                let mut v = SampleVoice::new();
-                let take = Take { rr, ..Take::default() };
-                assert!(v.start(0, &ev, &bank, p as i32, 48000.0, &mut Rng::new(1), 0, take));
-                let y: Vec<f32> = (0..28800).map(|i| v.process(&ev, i as f64 * 0.04, 48000.0, &bank).0).collect();
-                let hz = estimate_hz(&y[7200..], 48000.0);
-                let c = 1200.0 * (hz / midi_to_hz(p)).log2();
-                assert!(c.abs() < 20.0, "midi {p} rr {rr}: {hz:.1} Hz ({c:+.1} cents)");
-            }
-        }
-        let ev = NoteEvent { end: 100_000, pitch: 40.0, velocity: 0.8, palm_mute: true, ..Default::default() };
-        let mut v = SampleVoice::new();
-        assert!(v.start(0, &ev, &bank, 40, 48000.0, &mut Rng::new(1), 0, Take::default()));
-        assert!(v.real_mute, "palm mute should use a recorded muted take");
-        let open = render(&bank, &NoteEvent { palm_mute: false, ..ev.clone() }, 0.6);
-        let pm = render(&bank, &ev, 0.6);
-        let tail = |y: &[f32]| y[(0.4 * 48000.0) as usize..].iter().map(|s| s * s).sum::<f32>();
-        assert!(tail(&pm) < tail(&open) * 0.2, "recorded palm mute should decay faster");
     }
 
     #[test]

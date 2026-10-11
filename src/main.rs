@@ -92,7 +92,7 @@ fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 }
 
 /// Offline render: `--render <song> <out.wav> [--speed 0.5] [--solo N] [--start-measure M] [--seconds S]
-/// [--synth] [--nam model.nam | --no-nam] [--single] [--di freepats]`
+/// [--synth] [--nam model.nam | --no-nam] [--single]`
 fn render(args: &[String]) -> anyhow::Result<()> {
     use std::sync::Arc;
     use synth::{Command, Engine, Shared};
@@ -118,24 +118,20 @@ fn render(args: &[String]) -> anyhow::Result<()> {
     engine.handle(Command::SetSchedule(sched.clone()));
     engine.handle(Command::NamOptions(synth::NamOptions {
         double_track: !args.iter().any(|a| a == "--single"),
-        freepats_di: arg_value(args, "--di") == Some("freepats"),
     }));
-    if tones.contains(&model::ToneKind::Nam) {
+    if tones.iter().any(|t| matches!(t, model::ToneKind::Nam | model::ToneKind::Clean)) {
         match &nam_path {
             Some(p) => {
                 let m = synth::nam::NamModel::load(p)?;
                 println!("NAM model: {} ({})", m.name, p.display());
                 engine.handle(Command::Nam(Some(Arc::new(m))));
             }
-            None => println!("no .nam model found; distorted guitars use a basic built-in drive"),
+            None => println!("no .nam model found; guitars use a basic built-in amp"),
         }
     }
     if !args.iter().any(|a| a == "--synth") {
         let lib = synth::sampler::Library::new();
         let mut ids: Vec<_> = tones.iter().filter_map(|&t| synth::sampler::BankId::for_tone(t)).collect();
-        if tones.contains(&model::ToneKind::Nam) {
-            ids.push(synth::sampler::BankId::GuitarDirect);
-        }
         ids.sort_by_key(|i| i.index());
         ids.dedup();
         for id in ids {
@@ -227,7 +223,7 @@ fn main() -> anyhow::Result<()> {
         Some("--nam-render") => nam_render(&args),
         Some("--download-sounds") => download_sounds(),
         Some("--help") | Some("-h") => {
-            println!("usage: guitar-practice-tool [song.gp5]\n       guitar-practice-tool --dump <song>\n       guitar-practice-tool --render <song> <out.wav> [--speed x] [--solo n] [--start-measure m] [--seconds s]\n           [--synth] [--nam model.nam | --no-nam] [--single] [--di freepats]\n       guitar-practice-tool --nam-render <model.nam> <in.wav> <out.wav>\n       guitar-practice-tool --download-sounds");
+            println!("usage: guitar-practice-tool [song.gp5]\n       guitar-practice-tool --dump <song>\n       guitar-practice-tool --render <song> <out.wav> [--speed x] [--solo n] [--start-measure m] [--seconds s]\n           [--synth] [--nam model.nam | --no-nam] [--single]\n       guitar-practice-tool --nam-render <model.nam> <in.wav> <out.wav>\n       guitar-practice-tool --download-sounds");
             Ok(())
         }
         _ => run_gui(args.first().map(PathBuf::from)),

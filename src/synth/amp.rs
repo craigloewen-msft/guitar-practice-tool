@@ -4,7 +4,8 @@ use super::dsp::{Biquad, Eq};
 use super::nam::NamModel;
 use crate::model::ToneKind;
 
-/// Neural Amp Modeler stage: overdrive-style boost into one capture per side.
+/// Neural Amp Modeler stage: the synthesized string (pickup signal) into one capture per
+/// side. Drive mode adds an overdrive-style boost; clean mode turns the input down.
 struct NamStage {
     /// One instance for a centred guitar, two (L/R) for a double-tracked one.
     models: Vec<NamModel>,
@@ -16,23 +17,31 @@ struct NamStage {
 }
 
 impl NamStage {
-    fn new(model: &NamModel, sr: f32, stereo: bool) -> Self {
-        // Tube-screamer-like tightening in front of the amp, as metal players do.
+    fn new(model: &NamModel, sr: f32, stereo: bool, clean: bool) -> Self {
+        let db = |x: f32| 10f32.powf(x / 20.0);
+        // The capture is a fixed amp setting. The clean tone rolls the guitar volume back to
+        // the edge of breakup and voices it like a neck pickup; the high-gain amp's thin,
+        // bright small-signal response is evened out after it.
+        // Loaded pickup resonance (bridge humbucker / neck), which a real pickup puts on the DI.
+        let (hp, pickup_hz, pickup_q) = if clean { (70.0, 2300.0, 0.8) } else { (110.0, 2600.0, 0.9) };
+        let (low_db, lp) = if clean { (9.0, 2600.0) } else { (6.0, 6000.0) };
         let pre = || {
-            Eq(vec![
-                Biquad::highpass(sr, 110.0, 0.6),
-                Biquad::peaking(sr, 750.0, 0.9, 4.0),
-                Biquad::lowpass(sr, 6500.0, 0.7),
-            ])
+            let mut f = vec![Biquad::highpass(sr, hp, 0.6), Biquad::lowpass(sr, pickup_hz, pickup_q)];
+            if !clean {
+                // Tube-screamer-like tightening in front of the amp, as metal players do.
+                f.push(Biquad::peaking(sr, 750.0, 0.9, 4.0));
+            }
+            Eq(f)
         };
-        let post = || Eq(vec![Biquad::highpass(sr, 60.0, 0.7), Biquad::lowpass(sr, 10000.0, 0.7)]);
+        let post = || Eq(vec![Biquad::highpass(sr, 60.0, 0.7), Biquad::lowshelf(sr, 200.0, low_db), Biquad::lowpass(sr, lp, 0.7)]);
         // Captures are normalised to a reference output loudness; bring them to the
         // level of the other tones.
-        let out_gain = 10f32.powf((-23.0 - model.loudness.unwrap_or(-23.0)) / 20.0) * 3.0;
+        let loud = model.loudness.unwrap_or(-23.0);
+        let (in_gain, out_gain) = if clean { (db(-40.0), db(-13.0 - loud)) } else { (db(4.0), db(-23.0 - loud) * 3.0) };
         NamStage {
             models: (0..if stereo { 2 } else { 1 }).map(|_| model.clone()).collect(),
             pre: [pre(), pre()],
-            in_gain: 10f32.powf(4.0 / 20.0),
+            in_gain,
             out_gain,
             post: [post(), post()],
             tmp: Vec::new(),
@@ -156,16 +165,6 @@ impl AmpChain {
                 chain.out_gain = 0.55;
                 chain.reverb_send = 0.03;
             }
-            ToneKind::Acoustic => {
-                chain.pre = Eq(vec![
-                    Biquad::highpass(sr, 70.0, 0.7),
-                    Biquad::peaking(sr, 105.0, 2.5, 5.0),
-                    Biquad::peaking(sr, 230.0, 2.0, 3.0),
-                    Biquad::highshelf(sr, 5000.0, 3.0),
-                ]);
-                chain.out_gain = 0.6;
-                chain.reverb_send = 0.2;
-            }
             ToneKind::Drums => {
                 chain.out_gain = 0.38;
                 chain.reverb_send = 0.07;
@@ -199,12 +198,13 @@ impl AmpChain {
         self.post.process(y) * self.out_gain
     }
 
-    /// A chain driven by a Neural Amp Modeler capture. `stereo`: separate amps for the
-    /// left and right takes of a double-tracked part.
-    pub fn with_nam(model: &NamModel, sr: f32, stereo: bool) -> Self {
-        let mut chain = AmpChain::new(ToneKind::Nam, sr, false);
-        chain.nam = Some(Box::new(NamStage::new(model, sr, stereo)));
-        chain.reverb_send = 0.06;
+    /// A guitar chain driven by a Neural Amp Modeler capture. `stereo`: separate amps for
+    /// the left and right takes of a double-tracked part.
+    pub fn with_nam(model: &NamModel, sr: f32, tone: ToneKind, stereo: bool) -> Self {
+        let clean = tone == ToneKind::Clean;
+        let mut chain = AmpChain::new(tone, sr, false);
+        chain.nam = Some(Box::new(NamStage::new(model, sr, stereo && !clean, clean)));
+        chain.reverb_send = if clean { 0.2 } else { 0.06 };
         chain
     }
 

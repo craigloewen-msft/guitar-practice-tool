@@ -1,7 +1,7 @@
 //! Main application window.
 
 #[cfg(test)]
-mod screenshots;
+pub(crate) mod screenshots;
 mod tab;
 mod theme;
 
@@ -149,13 +149,10 @@ impl App {
     /// Start loading the sound bank for a tone in the background (no-op if already requested).
     fn request_bank(&self, tone: ToneKind) {
         let Some(audio) = &self.audio else { return };
-        let mut ids: Vec<BankId> = BankId::for_tone(tone).into_iter().collect();
-        if tone == ToneKind::Nam {
-            // Fallback DI when the humbucker recordings are not installed.
-            ids.push(BankId::GuitarDirect);
+        if matches!(tone, ToneKind::Nam | ToneKind::Clean) {
             self.request_nam();
         }
-        for id in ids {
+        if let Some(id) = BankId::for_tone(tone) {
             let tx = audio.tx.clone();
             let ctx = self.ctx.clone();
             self.library.request(id, move |bank| {
@@ -872,11 +869,11 @@ impl App {
         ui.horizontal(|ui| {
             status_dot(ui, if self.sounds_ok { GOOD } else { WARN });
             ui.vertical(|ui| {
-                ui.label(RichText::new("Instrument samples").strong().color(TEXT));
+                ui.label(RichText::new("Bass & drum samples").strong().color(TEXT));
                 let sub = if self.sounds_ok {
-                    "Installed: clean guitar DI, humbucker DI, bass and drum kit."
+                    "Installed: picked and finger bass, drum kit."
                 } else {
-                    "Free guitar, bass and drum recordings (about 600 MB download)."
+                    "Free bass and drum recordings (about 220 MB download)."
                 };
                 ui.label(RichText::new(sub).small().color(MUTED));
             });

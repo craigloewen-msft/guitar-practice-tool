@@ -19,27 +19,25 @@ use drums::DrumVoice;
 use dsp::{soft_limit, Rng};
 use reverb::Reverb;
 use nam::NamModel;
-use sampler::{gm_to_kit, Bank, BankId, SampleVoice, Take};
-use string::{State, StringVoice};
+use sampler::{gm_to_kit, Bank, BankId, SampleVoice};
+use string::{State, StringVoice, Take};
 
-const MAX_STRING_VOICES: usize = 64;
+const MAX_STRING_VOICES: usize = 96;
 const MAX_DRUM_VOICES: usize = 32;
 const MAX_SAMPLE_VOICES: usize = 128;
 /// Frames rendered per block (amp models process blocks).
 const BLOCK: usize = 256;
 
-/// How guitars on the "Metal (NAM amp)" tone are produced.
+/// How guitars on the "NAM drive" tone are produced.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NamOptions {
     /// Two performances panned hard left/right, each through its own amp.
     pub double_track: bool,
-    /// Use the FreePats DI only (no recorded palm mutes) instead of the hybrid DI.
-    pub freepats_di: bool,
 }
 
 impl Default for NamOptions {
     fn default() -> Self {
-        NamOptions { double_track: true, freepats_di: false }
+        NamOptions { double_track: true }
     }
 }
 
@@ -59,7 +57,7 @@ pub enum Command {
     MasterVolume(f32),
     /// A sound bank finished loading.
     Bank(BankId, Arc<Bank>),
-    /// Neural Amp Modeler capture for the "Metal (NAM amp)" tone.
+    /// Neural Amp Modeler capture that powers every guitar tone.
     Nam(Option<Arc<NamModel>>),
     NamOptions(NamOptions),
 }
@@ -250,8 +248,8 @@ impl Engine {
 
     fn rebuild_nam_chains(&mut self) {
         for i in 0..self.tones.len() {
-            if self.tones[i] == ToneKind::Nam {
-                for v in self.svoices.iter_mut().filter(|v| v.track == i) {
+            if matches!(self.tones[i], ToneKind::Nam | ToneKind::Clean) {
+                for v in self.voices.iter_mut().filter(|v| v.track == i) {
                     v.choke();
                 }
                 self.chains[i] = self.make_chain(i);
@@ -259,28 +257,21 @@ impl Engine {
         }
     }
 
-    /// Loaded sound bank for a track's tone, if any.
+    /// Loaded sound bank for a track's tone (bass and drums only), if any.
     fn track_bank(&self, track: usize) -> Option<&Arc<Bank>> {
         let tone = *self.tones.get(track)?;
-        if tone == ToneKind::Nam {
-            // Prefer the DI with recorded palm mutes; the plain FreePats DI also works.
-            let hybrid = self.banks[BankId::GuitarHybridDi.index()].as_ref().filter(|_| !self.nam_opts.freepats_di);
-            return hybrid.or(self.banks[BankId::GuitarDirect.index()].as_ref());
-        }
         self.banks[BankId::for_tone(tone)?.index()].as_ref()
     }
 
     fn is_double_tracked(&self, track: usize) -> bool {
-        self.nam_opts.double_track && self.chains.get(track).is_some_and(|c| c.is_nam())
+        self.nam_opts.double_track && self.tones.get(track) == Some(&ToneKind::Nam) && self.chains.get(track).is_some_and(|c| c.is_nam())
     }
 
     fn make_chain(&self, track: usize) -> AmpChain {
         let tone = self.tones[track];
         let bank = self.track_bank(track);
-        if tone == ToneKind::Nam {
-            if let (Some(model), Some(_)) = (&self.nam, bank) {
-                return AmpChain::with_nam(model, self.sr, self.nam_opts.double_track);
-            }
+        if let (ToneKind::Nam | ToneKind::Clean, Some(model)) = (tone, &self.nam) {
+            return AmpChain::with_nam(model, self.sr, tone, self.nam_opts.double_track);
         }
         let processed = bank.is_some_and(|b| b.id.is_processed());
         AmpChain::new(tone, self.sr, processed)
@@ -363,7 +354,7 @@ impl Engine {
             if ev.pitch as i32 == 44 {
                 e.velocity *= 0.7;
             }
-            return self.svoices[slot].start(idx, &e, &bank, key, self.sr, &mut self.rng, self.age, Take::default());
+            return self.svoices[slot].start(idx, &e, &bank, key, self.sr, &mut self.rng, self.age);
         }
         let on_string =
             |v: &SampleVoice| matches!(v.state, State::Sounding | State::Released) && !v.drum && v.track == ev.track && v.string == ev.string;
@@ -386,23 +377,7 @@ impl Engine {
             e.velocity *= 0.6;
         }
         let key = (ev.pitch + ev.curve_at(0.0)).round() as i32;
-        let rr = (self.rng.next().abs() * 1024.0) as u32;
-        if !self.is_double_tracked(ev.track) {
-            return self.svoices[slot].start(idx, &e, &bank, key, self.sr, &mut self.rng, self.age, Take { rr, ..Take::default() });
-        }
-        // Double-tracked: a second, slightly different performance on the other side.
-        let left = Take { rr, gl: 1.0, gr: 0.0, delay: 0, detune: 0.0 };
-        let right = Take {
-            rr: rr + 1,
-            gl: 0.0,
-            gr: 1.0,
-            delay: (self.rng.next().abs() * 0.008 * self.sr) as u32,
-            detune: self.rng.next() * 0.04,
-        };
-        let ok = self.svoices[slot].start(idx, &e, &bank, key, self.sr, &mut self.rng, self.age, left);
-        let slot2 = self.alloc_sample_voice();
-        e.velocity = (e.velocity * (1.0 + self.rng.next() * 0.08)).min(1.0);
-        self.svoices[slot2].start(idx, &e, &bank, key, self.sr, &mut self.rng, self.age, right) || ok
+        self.svoices[slot].start(idx, &e, &bank, key, self.sr, &mut self.rng, self.age)
     }
 
     fn trigger(&mut self, sched: &Schedule, idx: usize) {
@@ -429,36 +404,42 @@ impl Engine {
             self.drums[slot].trigger(ev.track, key, ev.velocity, self.sr, &mut self.rng, self.age);
             return;
         }
-        let existing = self
-            .voices
-            .iter()
-            .position(|v| matches!(v.state, State::Sounding | State::Released) && v.track == ev.track && v.string == ev.string);
-        if ev.legato {
-            if let Some(i) = existing {
-                if self.voices[i].level() > 1e-3 {
-                    self.voices[i].legato(idx, ev);
-                    return;
-                }
+        // Every take of a double-tracked part follows the same string.
+        let on_string =
+            |v: &StringVoice| matches!(v.state, State::Sounding | State::Released) && v.track == ev.track && v.string == ev.string;
+        if ev.legato && self.voices.iter().any(|v| on_string(v) && v.level() > 1e-3) {
+            for v in self.voices.iter_mut().filter(|v| on_string(v)) {
+                v.legato(idx, ev);
             }
+            return;
         }
-        if let Some(i) = existing {
-            self.voices[i].choke();
+        for v in self.voices.iter_mut().filter(|v| on_string(v)) {
+            v.choke();
         }
-        let slot = self.alloc_string_voice();
         let tone = self.tones.get(ev.track).copied().unwrap_or(ToneKind::Clean);
-        // Legato notes without a sounding predecessor are played softly.
-        let mut ev_local_vel = ev.velocity;
+        let mut e = ev.clone();
         if ev.legato {
-            ev_local_vel *= 0.6;
+            // Legato note without a sounding predecessor: play it softly.
+            e.velocity *= 0.6;
         }
-        let v = &mut self.voices[slot];
-        if (ev_local_vel - ev.velocity).abs() > f32::EPSILON {
-            let mut e = ev.clone();
-            e.velocity = ev_local_vel;
-            v.pluck(idx, &e, tone, self.sr, &mut self.rng, self.age);
-        } else {
-            v.pluck(idx, ev, tone, self.sr, &mut self.rng, self.age);
+        if !self.is_double_tracked(ev.track) {
+            let slot = self.alloc_string_voice();
+            self.voices[slot].pluck(idx, &e, tone, self.sr, &mut self.rng, self.age, Take::default());
+            return;
         }
+        // Double-tracked: a second, slightly different performance on the other side.
+        let left = Take { gl: 1.0, gr: 0.0, delay: 0, detune: 0.0 };
+        let right = Take {
+            gl: 0.0,
+            gr: 1.0,
+            delay: (self.rng.next().abs() * 0.008 * self.sr) as u32,
+            detune: self.rng.next() * 0.05,
+        };
+        let slot = self.alloc_string_voice();
+        self.voices[slot].pluck(idx, &e, tone, self.sr, &mut self.rng, self.age, left);
+        let slot2 = self.alloc_string_voice();
+        e.velocity = (e.velocity * (1.0 + self.rng.next() * 0.08)).min(1.0);
+        self.voices[slot2].pluck(idx, &e, tone, self.sr, &mut self.rng, self.age, right);
     }
 
     fn start_click(&mut self, accent: bool) {
@@ -556,8 +537,8 @@ impl Engine {
                 }
                 let s = v.process(ev, pos - ev.start as f64, sr);
                 if let Some(b) = self.track_buf.get_mut(v.track) {
-                    b[0][i] += s;
-                    b[1][i] += s;
+                    b[0][i] += s * v.take.gl;
+                    b[1][i] += s * v.take.gr;
                 }
             }
             for d in self.drums.iter_mut().filter(|d| d.active) {

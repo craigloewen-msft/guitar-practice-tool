@@ -1,4 +1,5 @@
-//! Physically-inspired plucked string (extended Karplus-Strong).
+//! Physically-inspired plucked string (extended Karplus-Strong). For guitars this is the
+//! dry pickup signal (DI) that drives the neural amp model.
 
 use super::dsp::{flush, midi_to_hz, Rng};
 use crate::model::ToneKind;
@@ -25,14 +26,32 @@ pub struct StringParams {
 impl StringParams {
     pub fn for_tone(tone: ToneKind) -> Self {
         match tone {
-            ToneKind::Acoustic => StringParams { loop_a: 0.06, t60_low: 5.0, t60_high: 1.6, pickup: 0.0, pick: 0.17, pick_dark: 0.15 },
+            // Neck pickup.
             ToneKind::Clean => StringParams { loop_a: 0.10, t60_low: 6.0, t60_high: 2.0, pickup: 0.22, pick: 0.15, pick_dark: 0.25 },
+            // Bridge humbucker.
             ToneKind::Nam => {
                 StringParams { loop_a: 0.10, t60_low: 7.0, t60_high: 2.5, pickup: 0.11, pick: 0.13, pick_dark: 0.2 }
             }
             ToneKind::Bass | ToneKind::FingerBass => StringParams { loop_a: 0.32, t60_low: 5.0, t60_high: 2.0, pickup: 0.18, pick: 0.2, pick_dark: 0.55 },
             ToneKind::Drums => StringParams { loop_a: 0.2, t60_low: 1.0, t60_high: 1.0, pickup: 0.0, pick: 0.2, pick_dark: 0.3 },
         }
+    }
+}
+
+/// Per-voice performance variation (the two takes of a double-tracked guitar).
+#[derive(Clone, Copy)]
+pub struct Take {
+    pub gl: f32,
+    pub gr: f32,
+    /// Samples before the note sounds.
+    pub delay: u32,
+    /// Semitones.
+    pub detune: f32,
+}
+
+impl Default for Take {
+    fn default() -> Self {
+        Take { gl: 1.0, gr: 1.0, delay: 0, detune: 0.0 }
     }
 }
 
@@ -69,6 +88,7 @@ pub struct StringVoice {
     pickup_on: bool,
     dc_x: f32,
     dc_y: f32,
+    pub take: Take,
 }
 
 impl StringVoice {
@@ -95,6 +115,7 @@ impl StringVoice {
             pickup_on: true,
             dc_x: 0.0,
             dc_y: 0.0,
+            take: Take::default(),
         }
     }
 
@@ -132,8 +153,10 @@ impl StringVoice {
     }
 
     /// Start a new plucked note.
-    pub fn pluck(&mut self, ev_idx: usize, ev: &NoteEvent, tone: ToneKind, sr: f32, rng: &mut Rng, age: u64) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn pluck(&mut self, ev_idx: usize, ev: &NoteEvent, tone: ToneKind, sr: f32, rng: &mut Rng, age: u64, take: Take) {
         self.params = StringParams::for_tone(tone);
+        self.take = take;
         self.state = State::Sounding;
         self.track = ev.track;
         self.string = ev.string;
@@ -151,7 +174,7 @@ impl StringVoice {
         self.loop_a_target = self.loop_a;
         self.t60 = self.sustain_t60(ev);
         self.t60_target = self.t60;
-        self.pitch = ev.pitch + ev.curve_at(0.0);
+        self.pitch = ev.pitch + ev.curve_at(0.0) + take.detune;
         self.buf.fill(0.0);
 
         let period = (sr / midi_to_hz(self.pitch)).clamp(4.0, (BUF - 4) as f32);
@@ -230,11 +253,18 @@ impl StringVoice {
     /// Render one sample. `rel_ticks` is the playback position relative to the controlling event start.
     #[inline]
     pub fn process(&mut self, ev: &NoteEvent, rel_ticks: f64, sr: f32) -> f32 {
+        if self.take.delay > 0 {
+            self.take.delay -= 1;
+            if self.state == State::Choked {
+                self.state = State::Idle;
+            }
+            return 0.0;
+        }
         // Smooth parameter changes.
         self.loop_a += (self.loop_a_target - self.loop_a) * 0.002;
         self.t60 += (self.t60_target - self.t60) * 0.01;
 
-        let mut target = ev.pitch + ev.curve_at(rel_ticks.max(0.0));
+        let mut target = ev.pitch + ev.curve_at(rel_ticks.max(0.0)) + self.take.detune;
         if let Some((vstart, depth)) = ev.vibrato {
             if rel_ticks >= vstart as f64 {
                 self.vib_phase += 5.5 / sr;
@@ -331,7 +361,7 @@ pub(crate) mod tests {
         let ev = NoteEvent { start: 0, end: 100_000, pitch, velocity: 0.8, curve, ..Default::default() };
         let mut v = StringVoice::new();
         let mut rng = Rng::new(1);
-        v.pluck(0, &ev, tone, sr, &mut rng, 0);
+        v.pluck(0, &ev, tone, sr, &mut rng, 0, Take::default());
         let ticks_per_sample = 960.0 * 2.0 / sr as f64; // 120 bpm
         let total = (secs * sr) as usize;
         let mut out = Vec::with_capacity(total);
@@ -347,7 +377,7 @@ pub(crate) mod tests {
 
     #[test]
     fn string_tuning_is_accurate() {
-        for tone in [ToneKind::Clean, ToneKind::Nam, ToneKind::Bass, ToneKind::Acoustic] {
+        for tone in [ToneKind::Clean, ToneKind::Nam, ToneKind::Bass] {
             for pitch in [28.0f32, 40.0, 45.0, 52.0, 64.0, 76.0, 86.0] {
                 if tone == ToneKind::Bass && pitch > 70.0 {
                     continue;
@@ -377,7 +407,7 @@ pub(crate) mod tests {
             let ev = NoteEvent { end: 100_000, pitch: 40.0, velocity: 0.8, palm_mute: pm, ..Default::default() };
             let mut v = StringVoice::new();
             let mut rng = Rng::new(1);
-            v.pluck(0, &ev, ToneKind::Nam, sr, &mut rng, 0);
+            v.pluck(0, &ev, ToneKind::Nam, sr, &mut rng, 0, Take::default());
             let y: Vec<f32> = (0..(0.6 * sr) as usize).map(|i| v.process(&ev, i as f64 * 0.04, sr)).collect();
             let tail = &y[(0.4 * sr) as usize..];
             (tail.iter().map(|s| s * s).sum::<f32>() / tail.len() as f32).sqrt()
