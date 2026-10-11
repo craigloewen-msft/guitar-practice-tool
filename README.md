@@ -1,5 +1,7 @@
 # Guitar Practice Tool
 
+This project was entirely vibe coded - so use at your own discretion.
+
 An offline Guitar Pro (`.gp3`/`.gp4`/`.gp5`) tab player for practicing. You can click the tab and press **Space** to play, switch tracks, mute or solo each track, loop bars, and slow down or speed up the tempo. Every guitar is a synthesized string played through a [Neural Amp Modeler](https://github.com/sdatkinson/NeuralAmpModelerPlugin) capture, using a WaveNet engine written in pure Rust. Bass and drums use samples.
 
 ## Install
