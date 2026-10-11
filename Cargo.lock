@@ -1533,6 +1533,7 @@ dependencies = [
  "eframe",
  "egui_kittest",
  "hound",
+ "rayon",
  "rfd",
  "rtrb",
  "rustysynth",

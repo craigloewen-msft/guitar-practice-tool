@@ -448,6 +448,28 @@ impl Engine {
         self.click_amp = if accent { 0.35 } else { 0.25 };
     }
 
+    pub fn sample_rate(&self) -> f32 {
+        self.sr
+    }
+
+    /// One-line snapshot of engine load, for `GPT_TRACE`.
+    pub fn trace_line(&self) -> String {
+        let any_solo = self.mix.iter().any(|m| m.solo);
+        let nam = (0..self.chains.len())
+            .filter(|&t| self.chains[t].is_nam() && self.mix.get(t).is_some_and(|m| !m.mute && (!any_solo || m.solo)))
+            .count();
+        format!(
+            "playing={} pos={:.0} speed={:.2} strings={} samples={} nam_chains={} sched={}",
+            self.playing,
+            self.pos,
+            self.speed,
+            self.voices.iter().filter(|v| v.is_active()).count(),
+            self.svoices.iter().filter(|v| v.is_active()).count(),
+            nam,
+            self.sched.is_some(),
+        )
+    }
+
     /// Render interleaved audio.
     pub fn process(&mut self, out: &mut [f32], channels: usize) {
         if let Some(rx) = self.rx.take() {
@@ -577,14 +599,15 @@ impl Engine {
         // Amp / cab per track.
         let any_solo = self.mix.iter().any(|m| m.solo);
         let audible: Vec<bool> = self.mix.iter().map(|m| !m.mute && (!any_solo || m.solo)).collect();
-        for t in 0..n_tracks {
-            let [bl, br] = &mut self.track_buf[t];
-            // Neural amp models are expensive: skip them for tracks nobody hears.
-            if self.chains[t].is_nam() && !audible[t] {
-                continue;
-            }
-            self.chains[t].process_block(&mut bl[..n], &mut br[..n]);
-        }
+        // Neural amp models are expensive: skip them for tracks nobody hears, and run the
+        // rest in parallel (each track's chain is independent).
+        use rayon::prelude::*;
+        self.chains[..n_tracks]
+            .par_iter_mut()
+            .zip(&mut self.track_buf[..n_tracks])
+            .zip(&audible[..n_tracks])
+            .filter(|((c, _), a)| **a || !c.is_nam())
+            .for_each(|((chain, [bl, br]), _)| chain.process_block(&mut bl[..n], &mut br[..n]));
 
         // Mix.
         for (i, frame) in out.chunks_mut(channels).enumerate() {

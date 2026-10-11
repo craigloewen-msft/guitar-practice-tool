@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -14,8 +14,9 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use crate::synth::{Command, Engine, Shared};
 
 /// Frames kept rendered ahead of the sound card. The engine (neural amp models in
-/// particular) runs on its own thread so a slow block never starves the device.
-const AHEAD_FRAMES: usize = 2048;
+/// particular) runs on its own thread so a slow block never starves the device;
+/// ~85 ms at 48 kHz absorbs scheduling hiccups and is unnoticeable for practice.
+const AHEAD_FRAMES: usize = 4096;
 const RING_FRAMES: usize = 32768;
 /// Frames rendered per engine call on the render thread.
 const CHUNK_FRAMES: usize = 256;
@@ -49,6 +50,17 @@ impl AudioOut {
         let (tx, rx) = channel();
         let engine = Engine::new(config.sample_rate as f32, shared.clone(), Some(rx));
         let sample_rate = config.sample_rate;
+        if trace_enabled() {
+            eprintln!(
+                "[trace] build={} host={:?} device={:?} rate={} channels={} format={format} buffer={:?}",
+                if cfg!(debug_assertions) { "dev profile (use --release for best performance)" } else { "release" },
+                host.id(),
+                device.description().map(|d| d.name().to_string()).unwrap_or_default(),
+                sample_rate,
+                channels,
+                supported_buffer(&device),
+            );
+        }
 
         let (producer, consumer) = RingBuffer::<f32>::new(RING_FRAMES * channels);
         // Largest buffer the device has asked for, so the render thread stays ahead of it.
@@ -98,16 +110,77 @@ impl Drop for AudioOut {
     }
 }
 
+pub fn trace_enabled() -> bool {
+    std::env::var_os("GPT_TRACE").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+fn supported_buffer(device: &cpal::Device) -> String {
+    device.default_output_config().map(|c| format!("{:?}", c.buffer_size())).unwrap_or_default()
+}
+
+/// Per-second render-thread statistics (`GPT_TRACE=1`).
+struct Trace {
+    since: Instant,
+    frames: usize,
+    busy: Duration,
+    worst: Duration,
+    min_fill: usize,
+    underruns: usize,
+}
+
+impl Trace {
+    fn new() -> Self {
+        Trace { since: Instant::now(), frames: 0, busy: Duration::ZERO, worst: Duration::ZERO, min_fill: usize::MAX, underruns: underruns() }
+    }
+
+    fn report(&mut self, engine: &Engine, sr: f32, channels: usize, device_frames: usize, fill: usize) {
+        let wall = self.since.elapsed().as_secs_f64();
+        let audio = self.frames as f64 / sr as f64;
+        let budget = CHUNK_FRAMES as f64 / sr as f64 * 1000.0;
+        let u = underruns();
+        eprintln!(
+            "[trace] rendered {:.2}s audio in {:.2}s wall | engine busy {:.0}% of real time | chunk avg {:.2}ms max {:.2}ms (budget {:.2}ms) | ring min {} frames | device {} frames | underruns +{} | {}",
+            audio,
+            wall,
+            if audio > 0.0 { 100.0 * self.busy.as_secs_f64() / audio } else { 0.0 },
+            if self.frames > 0 { self.busy.as_secs_f64() * 1000.0 / (self.frames / CHUNK_FRAMES) as f64 } else { 0.0 },
+            self.worst.as_secs_f64() * 1000.0,
+            budget,
+            if self.min_fill == usize::MAX { fill } else { self.min_fill } / channels,
+            device_frames,
+            u - self.underruns,
+            engine.trace_line(),
+        );
+        *self = Trace { underruns: u, ..Trace::new() };
+    }
+}
+
 fn render_loop(mut engine: Engine, mut producer: Producer<f32>, channels: usize, device_frames: Arc<AtomicUsize>, stop: Arc<AtomicBool>) {
     let mut buf = vec![0.0f32; CHUNK_FRAMES * channels];
+    let sr = engine.sample_rate();
+    let mut trace = trace_enabled().then(Trace::new);
     while !stop.load(Ordering::Relaxed) {
+        if let Some(t) = &mut trace {
+            if t.since.elapsed() >= Duration::from_secs(1) {
+                let fill = producer.buffer().capacity() - producer.slots();
+                t.report(&engine, sr, channels, device_frames.load(Ordering::Relaxed), fill);
+            }
+        }
         let target = AHEAD_FRAMES.max(2 * device_frames.load(Ordering::Relaxed)).min(RING_FRAMES) * channels;
         let buffered = producer.buffer().capacity() - producer.slots();
         if buffered + buf.len() > target {
             std::thread::park_timeout(Duration::from_millis(2));
             continue;
         }
+        let t0 = Instant::now();
         engine.process(&mut buf, channels);
+        if let Some(t) = &mut trace {
+            let dt = t0.elapsed();
+            t.busy += dt;
+            t.worst = t.worst.max(dt);
+            t.frames += CHUNK_FRAMES;
+            t.min_fill = t.min_fill.min(buffered);
+        }
         if let Ok(chunk) = producer.write_chunk_uninit(buf.len()) {
             chunk.fill_from_iter(buf.iter().copied());
         }

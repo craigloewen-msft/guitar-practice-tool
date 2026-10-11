@@ -734,6 +734,11 @@ impl NamModel {
         Ok(NamModel { net, sample_rate, loudness, name })
     }
 
+    /// Samples of input history that affect the current output.
+    pub fn receptive_field(&self) -> usize {
+        self.net.prewarm
+    }
+
     /// Process mono audio; `input` and `output` must have equal length.
     pub fn process(&mut self, input: &[f32], output: &mut [f32]) {
         for (i, o) in input.chunks(BLOCK).zip(output.chunks_mut(BLOCK)) {

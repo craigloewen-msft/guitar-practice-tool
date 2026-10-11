@@ -21,6 +21,8 @@ cargo run --release -- song.gp5
 
 Linux needs `libasound2-dev` and `pkg-config`. To make installers, run `cargo install cargo-packager`, then `cargo build --release && cargo packager --release`.
 
+If audio stutters, run with `GPT_TRACE=1` to print engine load and buffer underruns once a second.
+
 ## License
 
 The code is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

@@ -4,16 +4,56 @@ use super::dsp::{Biquad, Eq};
 use super::nam::NamModel;
 use crate::model::ToneKind;
 
+/// One capture instance with its own filters and silence gate.
+struct NamSide {
+    model: NamModel,
+    pre: Eq,
+    post: Eq,
+    tmp: Vec<f32>,
+    /// Consecutive near-silent input samples, and the model's last output. Once the whole
+    /// receptive field is silent the model's output is constant, so it can be skipped until
+    /// the input returns (most of the time, for most tracks).
+    quiet: usize,
+    hold: f32,
+    receptive: usize,
+}
+
+/// Pickup-signal level treated as silence (−120 dB), well under what the amp can reveal.
+const SILENCE: f32 = 1e-6;
+
+impl NamSide {
+    /// Pickup signal in `buf` → amp output in place.
+    fn process(&mut self, buf: &mut [f32], in_gain: f32, out_gain: f32) {
+        let n = buf.len();
+        self.tmp.resize(n, 0.0);
+        let mut peak = 0.0f32;
+        for x in buf.iter_mut() {
+            *x = self.pre.process(*x);
+            peak = peak.max(x.abs());
+        }
+        if peak < SILENCE && self.quiet >= self.receptive {
+            self.tmp.fill(self.hold);
+        } else {
+            self.quiet = if peak < SILENCE { self.quiet + n } else { 0 };
+            for x in buf.iter_mut() {
+                *x *= in_gain;
+            }
+            self.model.process(buf, &mut self.tmp);
+            self.hold = self.tmp[n - 1];
+        }
+        for (x, &y) in buf.iter_mut().zip(&self.tmp) {
+            *x = self.post.process(y) * out_gain;
+        }
+    }
+}
+
 /// Neural Amp Modeler stage: the synthesized string (pickup signal) into one capture per
 /// side. Drive mode adds an overdrive-style boost; clean mode turns the input down.
 struct NamStage {
     /// One instance for a centred guitar, two (L/R) for a double-tracked one.
-    models: Vec<NamModel>,
-    pre: [Eq; 2],
+    sides: Vec<NamSide>,
     in_gain: f32,
     out_gain: f32,
-    post: [Eq; 2],
-    tmp: Vec<f32>,
 }
 
 impl NamStage {
@@ -38,39 +78,38 @@ impl NamStage {
         // level of the other tones.
         let loud = model.loudness.unwrap_or(-23.0);
         let (in_gain, out_gain) = if clean { (db(-40.0), db(-13.0 - loud)) } else { (db(4.0), db(-23.0 - loud) * 3.0) };
-        NamStage {
-            models: (0..if stereo { 2 } else { 1 }).map(|_| model.clone()).collect(),
-            pre: [pre(), pre()],
-            in_gain,
-            out_gain,
-            post: [post(), post()],
+        let side = || NamSide {
+            model: model.clone(),
+            pre: pre(),
+            post: post(),
             tmp: Vec::new(),
-        }
+            quiet: 0,
+            hold: 0.0,
+            receptive: model.receptive_field(),
+        };
+        NamStage { sides: (0..if stereo { 2 } else { 1 }).map(|_| side()).collect(), in_gain, out_gain }
+    }
+
+    #[cfg(test)]
+    fn gated(&self) -> bool {
+        self.sides[0].quiet >= self.sides[0].receptive
     }
 
     fn process(&mut self, l: &mut [f32], r: &mut [f32]) {
-        let n = l.len();
-        self.tmp.resize(n, 0.0);
-        if self.models.len() == 1 {
-            for i in 0..n {
-                l[i] = self.pre[0].process(0.5 * (l[i] + r[i])) * self.in_gain;
-            }
-            self.models[0].process(l, &mut self.tmp);
-            for i in 0..n {
-                let y = self.post[0].process(self.tmp[i]) * self.out_gain;
-                l[i] = y;
-                r[i] = y;
-            }
-        } else {
-            for (c, buf) in [l, r].into_iter().enumerate() {
-                for x in buf.iter_mut() {
-                    *x = self.pre[c].process(*x) * self.in_gain;
+        let (gi, go) = (self.in_gain, self.out_gain);
+        match self.sides.as_mut_slice() {
+            [mono] => {
+                for (a, b) in l.iter_mut().zip(r.iter()) {
+                    *a = 0.5 * (*a + b);
                 }
-                self.models[c].process(buf, &mut self.tmp);
-                for (x, &y) in buf.iter_mut().zip(&self.tmp) {
-                    *x = self.post[c].process(y) * self.out_gain;
-                }
+                mono.process(l, gi, go);
+                r.copy_from_slice(l);
             }
+            // Double-tracked: the two captures are independent, so run them side by side.
+            [left, right] => {
+                rayon::join(|| left.process(l, gi, go), || right.process(r, gi, go));
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -240,5 +279,49 @@ impl AmpChain {
         self.aa_up.reset();
         self.aa_down.reset();
         self.last_in = 0.0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The silence gate must not change the sound: compare against the same stage with
+    /// gating disabled, across a note, a long rest (gated) and a second note.
+    #[test]
+    fn silence_gate_is_transparent() {
+        let Some(path) = crate::synth::nam::find_model() else {
+            eprintln!("skipping: no .nam model found");
+            return;
+        };
+        let model = NamModel::load(&path).unwrap();
+        for clean in [false, true] {
+            let mut gated = NamStage::new(&model, 48000.0, false, clean);
+            let mut always = NamStage::new(&model, 48000.0, false, clean);
+            always.sides[0].receptive = usize::MAX;
+            let note = |b: usize, i: usize| {
+                let t = (b * 256 + i) as f32 / 48000.0;
+                0.4 * (std::f32::consts::TAU * 110.0 * t).sin() * (-t * 8.0).exp()
+            };
+            let mut was_gated = false;
+            for b in 0..400 {
+                // Note in blocks 0..40 and 300..340, exact silence otherwise.
+                let src: Vec<f32> = (0..256)
+                    .map(|i| match b {
+                        0..40 => note(b, i),
+                        300..340 => note(b - 300, i),
+                        _ => 0.0,
+                    })
+                    .collect();
+                let (mut gl, mut gr, mut al, mut ar) = (src.clone(), src.clone(), src.clone(), src);
+                gated.process(&mut gl, &mut gr);
+                always.process(&mut al, &mut ar);
+                was_gated |= gated.gated();
+                for i in 0..256 {
+                    assert!((gl[i] - al[i]).abs() < 1e-4, "clean={clean} block {b}: {} vs {}", gl[i], al[i]);
+                }
+            }
+            assert!(was_gated, "clean={clean}: gate never engaged");
+        }
     }
 }
