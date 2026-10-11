@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#262a33"/>
+      <stop offset="1" stop-color="#14161b"/>
+    </linearGradient>
+    <linearGradient id="pick" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffa267"/>
+      <stop offset="1" stop-color="#ff5f3a"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#bg)"/>
+  <g stroke="#5b6372" stroke-width="14" stroke-linecap="round">
+    <line x1="170" y1="300" x2="854" y2="300"/>
+    <line x1="170" y1="385" x2="854" y2="385"/>
+    <line x1="170" y1="470" x2="854" y2="470"/>
+    <line x1="170" y1="555" x2="854" y2="555"/>
+    <line x1="170" y1="640" x2="854" y2="640"/>
+    <line x1="170" y1="725" x2="854" y2="725"/>
+  </g>
+  <path d="M512 840 C 420 760 270 560 270 410 C 270 290 380 236 512 236 C 644 236 754 290 754 410 C 754 560 604 760 512 840 Z"
+        fill="url(#pick)" stroke="#14161b" stroke-width="22"/>
+  <polygon points="462,400 462,600 610,500" fill="#14161b"/>
+</svg>

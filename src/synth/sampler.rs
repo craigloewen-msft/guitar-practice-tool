@@ -27,21 +27,15 @@ pub enum BankId {
     GuitarDirect,
     /// Humbucker DI with real palm-muted takes (low/mid notes) + FreePats DI (high notes).
     GuitarHybridDi,
-    GuitarDist1,
-    GuitarDist2,
-    GuitarClean,
     BassFinger,
     BassPicked,
     Drums,
 }
 
 impl BankId {
-    pub const ALL: [BankId; 8] = [
+    pub const ALL: [BankId; 5] = [
         BankId::GuitarDirect,
         BankId::GuitarHybridDi,
-        BankId::GuitarDist1,
-        BankId::GuitarDist2,
-        BankId::GuitarClean,
         BankId::BassFinger,
         BankId::BassPicked,
         BankId::Drums,
@@ -56,9 +50,6 @@ impl BankId {
     pub fn file_prefix(self) -> &'static str {
         match self {
             BankId::GuitarDirect | BankId::GuitarHybridDi => "EGuitarFSBS-direct",
-            BankId::GuitarDist1 => "EGuitarFSBS-dist1",
-            BankId::GuitarDist2 => "EGuitarFSBS-dist2",
-            BankId::GuitarClean => "EGuitarFSBS-clean",
             BankId::BassFinger => "FingerBassYR",
             BankId::BassPicked => "PickedBassYR",
             BankId::Drums => "MuldjordKit",
@@ -69,9 +60,6 @@ impl BankId {
         match self {
             BankId::GuitarDirect => "electric guitar (DI)",
             BankId::GuitarHybridDi => "humbucker guitar (DI)",
-            BankId::GuitarDist1 => "distorted guitar 1",
-            BankId::GuitarDist2 => "distorted guitar 2",
-            BankId::GuitarClean => "clean guitar",
             BankId::BassFinger => "finger bass",
             BankId::BassPicked => "picked bass",
             BankId::Drums => "drum kit",
@@ -81,11 +69,8 @@ impl BankId {
     /// Sound bank used by a track tone (`None`: synthesized).
     pub fn for_tone(tone: ToneKind) -> Option<BankId> {
         Some(match tone {
-            ToneKind::HighGain => BankId::GuitarDist2,
-            ToneKind::Crunch => BankId::GuitarDist1,
-            ToneKind::HighGainAmp | ToneKind::CrunchAmp | ToneKind::Acoustic => BankId::GuitarDirect,
+            ToneKind::Clean | ToneKind::Acoustic => BankId::GuitarDirect,
             ToneKind::Nam => BankId::GuitarHybridDi,
-            ToneKind::Clean => BankId::GuitarClean,
             ToneKind::Bass => BankId::BassPicked,
             ToneKind::FingerBass => BankId::BassFinger,
             ToneKind::Drums => BankId::Drums,
@@ -95,9 +80,6 @@ impl BankId {
     /// Level trim so every bank sits at a similar loudness in the mix (measured).
     pub fn trim(self) -> f32 {
         match self {
-            BankId::GuitarDist1 => 1.6,
-            BankId::GuitarDist2 => 1.35,
-            BankId::GuitarClean => 0.6,
             BankId::BassFinger | BankId::BassPicked => 0.75,
             BankId::Drums => 2.4,
             BankId::GuitarDirect | BankId::GuitarHybridDi => 1.0,
@@ -106,7 +88,7 @@ impl BankId {
 
     /// Whether the samples already contain the amplifier (no amp simulation needed).
     pub fn is_processed(self) -> bool {
-        matches!(self, BankId::GuitarDist1 | BankId::GuitarDist2 | BankId::GuitarClean | BankId::Drums)
+        self == BankId::Drums
     }
 }
 
@@ -746,7 +728,20 @@ impl Library {
     }
 
     fn find_humbucker_dir(&self) -> Option<PathBuf> {
-        self.dirs.iter().map(|d| d.join("humbucker-di")).find(|d| d.join("G#1_1_1.wav").is_file())
+        self.dirs.iter().map(|d| d.join("humbucker-di")).find(|d| d.join("A#3_4_2_muted.wav").is_file())
+    }
+
+    pub fn has_humbucker(&self) -> bool {
+        self.find_humbucker_dir().is_some()
+    }
+
+    /// Forget banks that were missing so they are looked up again (after a download).
+    pub fn rescan(&self) {
+        for s in self.state.lock().unwrap().iter_mut() {
+            if matches!(s, SlotState::Missing | SlotState::Failed(_)) {
+                *s = SlotState::Unrequested;
+            }
+        }
     }
 
     /// `Err(None)`: files not installed.
@@ -856,11 +851,8 @@ pub(crate) fn search_dirs() -> Vec<PathBuf> {
             }
         }
     }
-    let data_home = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
-    if let Some(d) = data_home {
-        dirs.push(d.join("guitar-practice-tool"));
+    if let Some(d) = crate::setup::data_dir() {
+        dirs.push(d);
     }
     dirs
 }
@@ -901,7 +893,7 @@ mod tests {
         }).collect()
     }
 
-    /// Runs only when the sample banks have been downloaded (scripts/fetch-sounds.sh).
+    /// Runs only when the sample banks have been downloaded (`--download-sounds`).
     #[test]
     fn sampled_pitch_and_palm_mute() {
         let lib = Library::new();

@@ -49,11 +49,6 @@ impl MeasureHeader {
 pub enum ToneKind {
     Acoustic,
     Clean,
-    Crunch,
-    HighGain,
-    /// Crunch / distortion from the DI guitar through the built-in amp simulator.
-    CrunchAmp,
-    HighGainAmp,
     /// DI guitar double-tracked through a Neural Amp Modeler capture.
     Nam,
     /// Picked bass.
@@ -63,26 +58,14 @@ pub enum ToneKind {
 }
 
 impl ToneKind {
-    pub const ALL_GUITAR: [ToneKind; 7] = [
-        ToneKind::Nam,
-        ToneKind::HighGain,
-        ToneKind::Crunch,
-        ToneKind::HighGainAmp,
-        ToneKind::CrunchAmp,
-        ToneKind::Clean,
-        ToneKind::Acoustic,
-    ];
+    pub const ALL_GUITAR: [ToneKind; 3] = [ToneKind::Nam, ToneKind::Clean, ToneKind::Acoustic];
     pub const ALL_BASS: [ToneKind; 2] = [ToneKind::Bass, ToneKind::FingerBass];
 
     pub fn label(self) -> &'static str {
         match self {
             ToneKind::Acoustic => "Acoustic",
             ToneKind::Clean => "Clean",
-            ToneKind::Crunch => "Crunch",
-            ToneKind::HighGain => "Distortion",
-            ToneKind::CrunchAmp => "Crunch (amp sim)",
-            ToneKind::HighGainAmp => "Distortion (amp sim)",
-            ToneKind::Nam => "Metal (NAM amp)",
+            ToneKind::Nam => "NAM amp",
             ToneKind::Bass => "Bass (pick)",
             ToneKind::FingerBass => "Bass (finger)",
             ToneKind::Drums => "Drums",
@@ -90,7 +73,7 @@ impl ToneKind {
     }
 
     pub fn is_distorted(self) -> bool {
-        matches!(self, ToneKind::Crunch | ToneKind::HighGain | ToneKind::CrunchAmp | ToneKind::HighGainAmp | ToneKind::Nam)
+        self == ToneKind::Nam
     }
 
     pub fn is_bass(self) -> bool {
@@ -118,21 +101,13 @@ pub struct Track {
 
 impl Track {
     /// Default tone, preferring the neural amp for distorted parts when a capture is installed.
-    pub fn default_tone_with_nam(&self, nam_available: bool) -> ToneKind {
-        match self.default_tone() {
-            ToneKind::Crunch | ToneKind::HighGain if nam_available => ToneKind::Nam,
-            t => t,
-        }
-    }
-
     pub fn default_tone(&self) -> ToneKind {
         if self.percussion {
             return ToneKind::Drums;
         }
         match self.program {
             24 | 25 => ToneKind::Acoustic,
-            29 => ToneKind::Crunch,
-            30 => ToneKind::HighGain,
+            29 | 30 => ToneKind::Nam,
             33 => ToneKind::FingerBass,
             32..=39 => ToneKind::Bass,
             _ => {

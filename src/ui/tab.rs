@@ -17,7 +17,7 @@ const LANE_TEXT: f32 = 10.0;
 const LANE_ORN: f32 = 27.0;
 const LANE_PM: f32 = 42.0;
 
-pub const BG: Color32 = Color32::from_rgb(24, 26, 31);
+pub const BG: Color32 = Color32::from_rgb(18, 20, 24);
 const INK: Color32 = Color32::from_rgb(222, 225, 230);
 const LINE: Color32 = Color32::from_rgb(78, 84, 94);
 const SOFT: Color32 = Color32::from_rgb(140, 146, 156);

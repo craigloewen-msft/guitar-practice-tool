@@ -105,14 +105,13 @@ impl AmpChain {
         if processed {
             chain.passthrough = true;
             (chain.out_gain, chain.reverb_send) = match tone {
-                ToneKind::Clean => (0.5, 0.22),
                 ToneKind::Drums => (0.5, 0.06),
                 _ => (0.42, 0.07),
             };
             return chain;
         }
         match tone {
-            ToneKind::HighGain | ToneKind::HighGainAmp | ToneKind::Nam => {
+            ToneKind::Nam => {
                 chain.pre = Eq(vec![
                     Biquad::highpass(sr, 130.0, 0.7),
                     Biquad::peaking(sr, 750.0, 0.8, 7.0),
@@ -131,25 +130,6 @@ impl AmpChain {
                 ]);
                 chain.out_gain = 0.32;
                 chain.reverb_send = 0.08;
-            }
-            ToneKind::Crunch | ToneKind::CrunchAmp => {
-                chain.pre = Eq(vec![
-                    Biquad::highpass(sr, 100.0, 0.7),
-                    Biquad::peaking(sr, 900.0, 0.8, 5.0),
-                    Biquad::lowpass(sr, 7500.0, 0.7),
-                ]);
-                chain.gain = 11.0;
-                chain.bias = 0.2;
-                chain.drive = true;
-                chain.post = Eq(vec![
-                    Biquad::highpass(sr, 80.0, 0.7),
-                    Biquad::peaking(sr, 600.0, 0.9, -2.0),
-                    Biquad::peaking(sr, 2200.0, 1.0, 3.5),
-                    Biquad::lowpass(sr, 5200.0, 1.0),
-                    Biquad::lowpass(sr, 7000.0, 0.6),
-                ]);
-                chain.out_gain = 0.42;
-                chain.reverb_send = 0.12;
             }
             ToneKind::Clean => {
                 chain.pre = Eq(vec![Biquad::highpass(sr, 70.0, 0.7)]);

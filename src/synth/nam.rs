@@ -811,6 +811,9 @@ pub fn find_model() -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("GPT_NAM_MODEL") {
         return Some(p.into());
     }
+    if let Some(p) = crate::setup::Settings::load().nam_model.filter(|p| p.is_file()) {
+        return Some(p);
+    }
     let mut dirs = Vec::new();
     for d in super::sampler::search_dirs() {
         dirs.push(d.join("nam"));

@@ -2,12 +2,61 @@
 name = "guitar-practice-tool"
 version = "0.1.0"
 edition = "2024"
+description = "Offline guitar tab player and practice tool with Neural Amp Modeler tone"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/OWNER/guitar-practice-tool"
+readme = "README.md"
+keywords = ["guitar", "tablature", "guitar-pro", "music", "practice"]
+categories = ["multimedia::audio"]
+exclude = ["/packaging/screenshots", "/.github"]
 
 [dependencies]
 anyhow = "1.0.104"
 cpal = "0.18.2"
+directories = "6.0.0"
 eframe = "0.36.2"
 hound = "3.5.1"
 rfd = "0.17.2"
 rustysynth = "1.3.7"
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sevenz-rust2 = { version = "0.23.0", default-features = false, features = ["util", "bzip2"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu", "eframe", "snapshot"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[package.metadata.packager]
+product-name = "Guitar Practice Tool"
+identifier = "io.github.guitar-practice-tool"
+publisher = "Guitar Practice Tool contributors"
+category = "Music"
+license-file = "LICENSE-MIT"
+out-dir = "target/dist"
+formats = ["deb", "appimage", "nsis", "app", "dmg"]
+icons = [
+  "packaging/icons/icon-32.png",
+  "packaging/icons/icon-128.png",
+  "packaging/icons/icon-256.png",
+  "packaging/icons/icon-512.png",
+  "packaging/icons/icon.ico",
+]
+
+[[package.metadata.packager.file-associations]]
+extensions = ["gp3", "gp4", "gp5"]
+mime-type = "application/x-guitar-pro"
+description = "Guitar Pro tablature"
+name = "Guitar Pro tablature"
+role = "viewer"
+
+[package.metadata.packager.deb]
+depends = ["libasound2"]
+section = "sound"
+
+[package.metadata.packager.macos]
+minimum-system-version = "11.0"

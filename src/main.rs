@@ -1,6 +1,9 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod audio;
 mod gp;
 mod model;
+mod setup;
 mod synth;
 mod timeline;
 mod ui;
@@ -89,7 +92,7 @@ fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 }
 
 /// Offline render: `--render <song> <out.wav> [--speed 0.5] [--solo N] [--start-measure M] [--seconds S]
-/// [--tone T] [--synth] [--nam model.nam | --no-nam] [--single] [--di freepats]`
+/// [--synth] [--nam model.nam | --no-nam] [--single] [--di freepats]`
 fn render(args: &[String]) -> anyhow::Result<()> {
     use std::sync::Arc;
     use synth::{Command, Engine, Shared};
@@ -104,17 +107,7 @@ fn render(args: &[String]) -> anyhow::Result<()> {
     } else {
         arg_value(args, "--nam").map(PathBuf::from).or_else(synth::nam::find_model)
     };
-    let mut tones: Vec<_> = song.tracks.iter().map(|t| t.default_tone_with_nam(nam_path.is_some())).collect();
-    if let Some(name) = arg_value(args, "--tone") {
-        let k = model::ToneKind::ALL_GUITAR
-            .into_iter()
-            .find(|k| k.label().to_lowercase().replace(' ', "") == name.to_lowercase())
-            .ok_or_else(|| anyhow::anyhow!("unknown tone {name}"))?;
-        // Only the distorted parts; clean/acoustic parts keep their tone.
-        for t in tones.iter_mut().filter(|t| t.is_distorted()) {
-            *t = k;
-        }
-    }
+    let tones: Vec<_> = song.tracks.iter().map(|t| t.default_tone()).collect();
     let sched = Arc::new(timeline::build_schedule(&song, &tones));
     let start_tick = sched
         .timeline
@@ -134,7 +127,7 @@ fn render(args: &[String]) -> anyhow::Result<()> {
                 println!("NAM model: {} ({})", m.name, p.display());
                 engine.handle(Command::Nam(Some(Arc::new(m))));
             }
-            None => println!("no .nam model found; Metal (NAM amp) uses the built-in amp sim"),
+            None => println!("no .nam model found; distorted guitars use a basic built-in drive"),
         }
     }
     if !args.iter().any(|a| a == "--synth") {
@@ -232,42 +225,51 @@ fn main() -> anyhow::Result<()> {
         Some("--dump") => dump(&PathBuf::from(&args[1])),
         Some("--render") => render(&args),
         Some("--nam-render") => nam_render(&args),
+        Some("--download-sounds") => download_sounds(),
         Some("--help") | Some("-h") => {
-            println!("usage: guitar-practice-tool [song.gp5]\n       guitar-practice-tool --dump <song>\n       guitar-practice-tool --render <song> <out.wav> [--speed x] [--solo n] [--start-measure m] [--seconds s]\n           [--tone t] [--synth] [--nam model.nam | --no-nam] [--single] [--di freepats]\n       guitar-practice-tool --nam-render <model.nam> <in.wav> <out.wav>");
+            println!("usage: guitar-practice-tool [song.gp5]\n       guitar-practice-tool --dump <song>\n       guitar-practice-tool --render <song> <out.wav> [--speed x] [--solo n] [--start-measure m] [--seconds s]\n           [--synth] [--nam model.nam | --no-nam] [--single] [--di freepats]\n       guitar-practice-tool --nam-render <model.nam> <in.wav> <out.wav>\n       guitar-practice-tool --download-sounds");
             Ok(())
         }
         _ => run_gui(args.first().map(PathBuf::from)),
     }
 }
 
-fn run_gui(path: Option<PathBuf>) -> anyhow::Result<()> {
-    // With no argument, pick up a Guitar Pro file in the current directory if there is one.
-    let path = path.or_else(|| {
-        let mut found: Vec<PathBuf> = std::fs::read_dir(".")
-            .ok()?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "gp3" | "gp4" | "gp5"))
-            })
-            .collect();
-        found.sort();
-        found.into_iter().next()
+fn download_sounds() -> anyhow::Result<()> {
+    let lib = synth::sampler::Library::new();
+    if setup::sounds_installed(&lib) {
+        println!("All sounds are already installed.");
+        return Ok(());
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let progress = setup::start_download(lib, move || {
+        let _ = tx.send(());
     });
+    let mut last = String::new();
+    while rx.recv_timeout(std::time::Duration::from_millis(500)).is_err() {
+        let p = progress.lock().unwrap().clone();
+        let line = format!("{} {:>3.0}%", p.stage, p.fraction() * 100.0);
+        if line != last {
+            println!("{line}");
+            last = line;
+        }
+    }
+    let r = progress.lock().unwrap().finished.clone().unwrap_or(Ok(()));
+    r.map_err(|e| anyhow::anyhow!(e))?;
+    println!("Sounds installed in {}", setup::data_dir().unwrap().display());
+    Ok(())
+}
+
+fn run_gui(path: Option<PathBuf>) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Guitar Practice")
+            .with_title(ui::APP_NAME)
             .with_app_id("guitar-practice-tool")
+            .with_icon(ui::icon())
             .with_inner_size([1400.0, 900.0])
-            .with_min_inner_size([700.0, 400.0])
+            .with_min_inner_size([820.0, 480.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };
-    eframe::run_native(
-        "Guitar Practice",
-        options,
-        Box::new(move |cc| Ok(Box::new(ui::App::new(cc, path)))),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))
+    eframe::run_native(ui::APP_NAME, options, Box::new(move |cc| Ok(Box::new(ui::App::new(cc, path)))))
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }

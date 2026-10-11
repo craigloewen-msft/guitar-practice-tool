@@ -27,7 +27,7 @@ impl StringParams {
         match tone {
             ToneKind::Acoustic => StringParams { loop_a: 0.06, t60_low: 5.0, t60_high: 1.6, pickup: 0.0, pick: 0.17, pick_dark: 0.15 },
             ToneKind::Clean => StringParams { loop_a: 0.10, t60_low: 6.0, t60_high: 2.0, pickup: 0.22, pick: 0.15, pick_dark: 0.25 },
-            ToneKind::Crunch | ToneKind::HighGain | ToneKind::CrunchAmp | ToneKind::HighGainAmp | ToneKind::Nam => {
+            ToneKind::Nam => {
                 StringParams { loop_a: 0.10, t60_low: 7.0, t60_high: 2.5, pickup: 0.11, pick: 0.13, pick_dark: 0.2 }
             }
             ToneKind::Bass | ToneKind::FingerBass => StringParams { loop_a: 0.32, t60_low: 5.0, t60_high: 2.0, pickup: 0.18, pick: 0.2, pick_dark: 0.55 },
@@ -347,7 +347,7 @@ pub(crate) mod tests {
 
     #[test]
     fn string_tuning_is_accurate() {
-        for tone in [ToneKind::Clean, ToneKind::HighGain, ToneKind::Bass, ToneKind::Acoustic] {
+        for tone in [ToneKind::Clean, ToneKind::Nam, ToneKind::Bass, ToneKind::Acoustic] {
             for pitch in [28.0f32, 40.0, 45.0, 52.0, 64.0, 76.0, 86.0] {
                 if tone == ToneKind::Bass && pitch > 70.0 {
                     continue;
@@ -364,7 +364,7 @@ pub(crate) mod tests {
     #[test]
     fn bend_reaches_target_pitch() {
         // full-step bend over the first quarter note (960 ticks = 0.5 s at 120 bpm), then held
-        let y = render(59.0, ToneKind::Crunch, vec![(0, 0.0), (960, 2.0)], 1.2, 0.75);
+        let y = render(59.0, ToneKind::Nam, vec![(0, 0.0), (960, 2.0)], 1.2, 0.75);
         let hz = estimate_hz(&y, 48000.0);
         let c = cents(hz, midi_to_hz(61.0));
         assert!(c.abs() < 8.0, "bent pitch {hz:.2} Hz is {c:+.1} cents from target");
@@ -377,7 +377,7 @@ pub(crate) mod tests {
             let ev = NoteEvent { end: 100_000, pitch: 40.0, velocity: 0.8, palm_mute: pm, ..Default::default() };
             let mut v = StringVoice::new();
             let mut rng = Rng::new(1);
-            v.pluck(0, &ev, ToneKind::HighGain, sr, &mut rng, 0);
+            v.pluck(0, &ev, ToneKind::Nam, sr, &mut rng, 0);
             let y: Vec<f32> = (0..(0.6 * sr) as usize).map(|i| v.process(&ev, i as f64 * 0.04, sr)).collect();
             let tail = &y[(0.4 * sr) as usize..];
             (tail.iter().map(|s| s * s).sum::<f32>() / tail.len() as f32).sqrt()
