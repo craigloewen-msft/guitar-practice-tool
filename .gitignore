@@ -9,5 +9,12 @@
 
 # Neural Amp Modeler captures belong to their authors; keep them local
 *.nam
+
+# Recordings and stems attached to a tab stay local
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.m4a
 # Generated tone comparison renders
 /tone-samples/

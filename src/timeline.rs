@@ -111,6 +111,21 @@ impl Timeline {
         self.tempo_secs[k] + (tick - t0 as f64) / TPQ as f64 * 60.0 / bpm
     }
 
+    /// Playback tick at the given time in seconds (inverse of `seconds_at`).
+    pub fn tick_at_seconds(&self, secs: f64) -> f64 {
+        if self.tempo_map.is_empty() {
+            return 0.0;
+        }
+        let k = self.tempo_secs.partition_point(|s| *s <= secs).saturating_sub(1);
+        let (t0, bpm) = self.tempo_map[k];
+        t0 as f64 + (secs - self.tempo_secs[k]) * bpm / 60.0 * TPQ as f64
+    }
+
+    /// Total length of the playback timeline in seconds (at 100% speed).
+    pub fn duration(&self) -> f64 {
+        self.seconds_at(self.total as f64)
+    }
+
     /// Index into `measures` of the play measure containing `tick`.
     pub fn locate(&self, tick: u64) -> Option<usize> {
         if self.measures.is_empty() {

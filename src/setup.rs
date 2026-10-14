@@ -22,6 +22,16 @@ fn settings_path() -> Option<PathBuf> {
     project_dirs().map(|p| p.config_dir().join("settings.json"))
 }
 
+/// Audio a user attached to one tab, so it comes back with the song next time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SongAudio {
+    pub tab: PathBuf,
+    pub stems: Vec<PathBuf>,
+    /// Hand adjustment to the alignment, in seconds. Belongs to this recording, not the app.
+    #[serde(default)]
+    pub trim: f64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -31,11 +41,23 @@ pub struct Settings {
     pub metronome: bool,
     pub count_in: bool,
     pub follow: bool,
+    pub song_audio: Vec<SongAudio>,
+    /// Level of the attached recording relative to the synth.
+    pub backing_volume: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { recent: Vec::new(), nam_model: None, master: 0.8, metronome: false, count_in: false, follow: true }
+        Settings {
+            recent: Vec::new(),
+            nam_model: None,
+            master: 0.8,
+            metronome: false,
+            count_in: false,
+            follow: true,
+            song_audio: Vec::new(),
+            backing_volume: 0.9,
+        }
     }
 }
 
@@ -57,12 +79,46 @@ impl Settings {
         }
     }
 
+    /// Audio previously attached to this tab, if the files are all still there.
+    pub fn audio_for(&self, tab: &Path) -> Option<Vec<PathBuf>> {
+        let tab = canonical(tab);
+        let e = self.song_audio.iter().find(|e| e.tab == tab)?;
+        e.stems.iter().all(|p| p.exists()).then(|| e.stems.clone())
+    }
+
+    pub fn remember_audio(&mut self, tab: &Path, stems: &[PathBuf]) {
+        let tab = canonical(tab);
+        self.song_audio.retain(|e| e.tab != tab);
+        if !stems.is_empty() {
+            self.song_audio
+                .insert(0, SongAudio { tab, stems: stems.iter().map(|p| canonical(p)).collect(), trim: 0.0 });
+            self.song_audio.truncate(32);
+        }
+    }
+
+    /// The hand nudge saved for this tab's recording.
+    pub fn trim_for(&self, tab: &Path) -> f64 {
+        let tab = canonical(tab);
+        self.song_audio.iter().find(|e| e.tab == tab).map_or(0.0, |e| e.trim)
+    }
+
+    pub fn remember_trim(&mut self, tab: &Path, trim: f64) {
+        let tab = canonical(tab);
+        if let Some(e) = self.song_audio.iter_mut().find(|e| e.tab == tab) {
+            e.trim = trim;
+        }
+    }
+
     pub fn push_recent(&mut self, path: &Path) {
-        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let path = canonical(path);
         self.recent.retain(|p| p != &path);
         self.recent.insert(0, path);
         self.recent.truncate(8);
     }
+}
+
+fn canonical(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Copy a user-chosen `.nam` capture into the data dir so it survives the original moving.

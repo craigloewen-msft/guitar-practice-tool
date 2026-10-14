@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
+use crate::backing::{BackingSet, MAX_STEMS};
 use crate::model::{ToneKind, TPQ};
 use crate::timeline::Schedule;
 use amp::AmpChain;
@@ -41,6 +42,16 @@ impl Default for NamOptions {
     }
 }
 
+/// What the transport plays back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Source {
+    /// The synthesised tab.
+    #[default]
+    Synth,
+    /// The attached recording, followed in sync with the tab.
+    Song,
+}
+
 pub enum Command {
     SetSchedule(Arc<Schedule>),
     Play,
@@ -60,6 +71,16 @@ pub enum Command {
     /// Neural Amp Modeler capture that powers every guitar tone.
     Nam(Option<Arc<NamModel>>),
     NamOptions(NamOptions),
+    /// Attach (or drop) a set of backing stems lined up with the score.
+    Backing(Option<Arc<BackingSet>>),
+    /// Listen to the synth or to the recording.
+    Source(Source),
+    /// 0..1 level for the recording as a whole.
+    BackingVolume(f32),
+    /// Hand adjustment to the alignment, in seconds. Positive plays the recording later.
+    Trim(f64),
+    /// 0..1 level for one stem, already folded together with its mute and any solo.
+    StemGain(usize, f32),
 }
 
 /// State shared with the UI thread.
@@ -119,6 +140,25 @@ pub struct Engine {
     click_freq: f32,
     click_amp: f32,
     master: f32,
+    backing: Option<Arc<BackingSet>>,
+    source: Source,
+    backing_volume: f32,
+    /// Hand adjustment to the alignment, in seconds.
+    backing_trim: f64,
+    /// Per-stem levels: what the mixer asks for, and what is currently being applied.
+    stem_gain: [f32; MAX_STEMS],
+    stem_cur: [f32; MAX_STEMS],
+    /// Smoothed gain, so starting and stopping the recording doesn't click.
+    back_gain: f32,
+    /// Position in the recording reached on the previous frame, in seconds.
+    back_t: f64,
+    /// Crossfade out of the pre-seek position: (time, frames left).
+    back_fade: Option<(f64, f32)>,
+    /// In Song mode the recording is the clock: its position in seconds (before the trim),
+    /// advancing at a steady rate while the tab follows. NaN until it has been taken from the
+    /// transport, which happens again after every seek or change of source.
+    clock: f64,
+    back_buf: [Vec<f32>; 2],
     shared: Arc<Shared>,
     rx: Option<Receiver<Command>>,
 }
@@ -157,6 +197,17 @@ impl Engine {
             click_freq: 1000.0,
             click_amp: 0.0,
             master: 0.8,
+            backing: None,
+            source: Source::Synth,
+            backing_volume: 0.9,
+            backing_trim: 0.0,
+            stem_gain: [1.0; MAX_STEMS],
+            stem_cur: [0.0; MAX_STEMS],
+            back_gain: 0.0,
+            back_t: f64::NAN,
+            clock: f64::NAN,
+            back_fade: None,
+            back_buf: [vec![0.0; BLOCK], vec![0.0; BLOCK]],
             shared,
             rx,
         }
@@ -198,6 +249,12 @@ impl Engine {
                 }
                 for v in &mut self.svoices {
                     v.release_with(if v.drum { 0.15 } else { 0.07 }, self.sr);
+                }
+                // With a loop active, pausing rewinds to its start so the next play
+                // run begins at the top of the loop. Voices keep their release tail
+                // (unlike `seek`, which chokes them).
+                if let Some((a, _)) = self.loop_range {
+                    self.locate_at(a);
                 }
             }
             Command::Seek(t) => self.seek(t),
@@ -243,6 +300,33 @@ impl Engine {
             Command::Metronome(m) => self.metronome = m,
             Command::CountIn(c) => self.count_in = c,
             Command::MasterVolume(v) => self.master = v,
+            Command::Backing(b) => {
+                self.backing = b;
+                self.back_t = f64::NAN;
+                self.clock = f64::NAN;
+                self.back_fade = None;
+            }
+            Command::Source(s) => {
+                if self.source != s {
+                    self.source = s;
+                    self.clock = f64::NAN;
+                    // Anything already ringing belongs to the other source.
+                    for v in &mut self.voices {
+                        v.release();
+                    }
+                    for v in &mut self.svoices {
+                        v.release_with(if v.drum { 0.15 } else { 0.07 }, self.sr);
+                    }
+                }
+            }
+            Command::BackingVolume(v) => self.backing_volume = v.clamp(0.0, 2.0),
+            // The read position jumps; the jump check in `process_block` fades across it.
+            Command::Trim(t) => self.backing_trim = t.clamp(-5.0, 5.0),
+            Command::StemGain(i, v) => {
+                if let Some(g) = self.stem_gain.get_mut(i) {
+                    *g = v.clamp(0.0, 2.0);
+                }
+            }
         }
     }
 
@@ -278,13 +362,19 @@ impl Engine {
     }
 
     fn seek(&mut self, tick: u64) {
-        self.pos = tick as f64;
         for v in &mut self.voices {
             v.choke();
         }
         for v in &mut self.svoices {
             v.choke();
         }
+        self.locate_at(tick);
+    }
+
+    /// Move the transport without touching sounding voices.
+    fn locate_at(&mut self, tick: u64) {
+        self.pos = tick as f64;
+        self.clock = f64::NAN;
         if let Some(s) = &self.sched {
             self.next_ev = s.events.partition_point(|e| e.start < tick);
             self.next_click = s.clicks.partition_point(|c| c.0 < tick);
@@ -489,6 +579,14 @@ impl Engine {
         self.shared.playing.store(self.playing || self.count_in_left > 0.0, Ordering::Relaxed);
     }
 
+    /// The recording keeping time, when it is the one being heard and it lined up.
+    fn song_clock(&self) -> Option<Arc<BackingSet>> {
+        if self.source != Source::Song {
+            return None;
+        }
+        self.backing.as_ref().filter(|b| b.align.ok()).cloned()
+    }
+
     /// Advance the transport by one frame, triggering due events.
     fn tick(&mut self, sched: &Schedule) {
         let tempo_map = &sched.timeline.tempo_map;
@@ -508,7 +606,10 @@ impl Engine {
         while self.next_ev < sched.events.len() && sched.events[self.next_ev].start as f64 <= self.pos {
             let i = self.next_ev;
             self.next_ev += 1;
-            self.trigger(sched, i);
+            // In song mode the recording carries the notes; the metronome still runs.
+            if self.source == Source::Synth {
+                self.trigger(sched, i);
+            }
         }
         while self.next_click < sched.clicks.len() && sched.clicks[self.next_click].0 as f64 <= self.pos {
             let accent = sched.clicks[self.next_click].1;
@@ -517,7 +618,20 @@ impl Engine {
                 self.start_click(accent);
             }
         }
-        self.pos += dt;
+        match self.song_clock() {
+            // The recording plays at a steady rate and never bends; the tab is carried along to
+            // wherever the alignment says the recording has got to. It never steps backwards,
+            // so a note can't be triggered twice.
+            Some(b) => {
+                if !self.clock.is_finite() {
+                    self.clock = b.audio_time(sched.timeline.seconds_at(self.pos));
+                }
+                self.clock += self.speed / self.sr as f64;
+                let to = sched.timeline.tick_at_seconds(b.score_time(self.clock));
+                self.pos = to.max(self.pos);
+            }
+            None => self.pos += dt,
+        }
         while self.tempo_idx + 1 < tempo_map.len() && tempo_map[self.tempo_idx + 1].0 as f64 <= self.pos {
             self.tempo_idx += 1;
         }
@@ -545,6 +659,15 @@ impl Engine {
             b[0][..n].fill(0.0);
             b[1][..n].fill(0.0);
         }
+        // Read by position, so looping, seeking and speed changes carry the recording along.
+        let backing = self.backing.clone();
+        let back_target = if self.source == Source::Song && self.playing && self.count_in_left <= 0.0 {
+            self.backing_volume
+        } else {
+            0.0
+        };
+        let fade_len = (sr * 0.006).max(1.0);
+        let gain_step = 1.0 / (sr * 0.01);
 
         // Voices, frame by frame, into per-track dry buffers.
         for i in 0..n {
@@ -552,6 +675,56 @@ impl Engine {
                 self.tick(sched);
             }
             let pos = self.pos;
+            match &backing {
+                Some(b) => {
+                    // The clock only runs in Song mode with a lined-up recording.
+                    let (t, step) = if self.clock.is_finite() {
+                        (self.clock + self.backing_trim, self.speed / sr as f64)
+                    } else {
+                        let t = b.audio_time(sched.timeline.seconds_at(pos)) + self.backing_trim;
+                        (t, self.speed * b.align.rate / sr as f64)
+                    };
+                    // A jump (seek, loop wrap) would click, so fade out of the old position.
+                    if self.back_t.is_finite() && (t - self.back_t - step).abs() > 0.002 {
+                        self.back_fade = Some((self.back_t, fade_len));
+                    }
+                    self.back_t = t;
+                    // Every stem shares one time scale, so they are all read at the same point.
+                    let fade = self.back_fade;
+                    let (mut l, mut r) = (0.0f32, 0.0f32);
+                    for (si, s) in b.stems.iter().enumerate().take(MAX_STEMS) {
+                        let g = &mut self.stem_cur[si];
+                        *g += (self.stem_gain[si] - *g).clamp(-gain_step, gain_step);
+                        if *g <= 0.0 {
+                            continue;
+                        }
+                        let (mut sl, mut sr) = s.sample_at(t);
+                        if let Some((ft, left)) = fade {
+                            let (fl, fr) = s.sample_at(ft);
+                            let k = left / fade_len;
+                            sl += (fl - sl) * k;
+                            sr += (fr - sr) * k;
+                        }
+                        l += sl * *g;
+                        r += sr * *g;
+                    }
+                    if let Some((ft, left)) = &mut self.back_fade {
+                        *ft += step;
+                        *left -= 1.0;
+                        if *left <= 0.0 {
+                            self.back_fade = None;
+                        }
+                    }
+                    self.back_gain += (back_target - self.back_gain).clamp(-gain_step, gain_step);
+                    self.back_buf[0][i] = l * self.back_gain;
+                    self.back_buf[1][i] = r * self.back_gain;
+                }
+                None => {
+                    self.back_gain = 0.0;
+                    self.back_buf[0][i] = 0.0;
+                    self.back_buf[1][i] = 0.0;
+                }
+            }
             for v in self.voices.iter_mut().filter(|v| v.is_active()) {
                 let ev = &sched.events[v.ev];
                 if v.state == State::Sounding && (pos >= ev.end as f64 || !self.playing) {
@@ -598,7 +771,13 @@ impl Engine {
 
         // Amp / cab per track.
         let any_solo = self.mix.iter().any(|m| m.solo);
-        let audible: Vec<bool> = self.mix.iter().map(|m| !m.mute && (!any_solo || m.solo)).collect();
+        // In song mode nothing new is triggered, so once the last tail has died the synth
+        // tracks can be skipped entirely instead of grinding amp models over silence.
+        let synth_on = self.source == Source::Synth
+            || self.voices.iter().any(|v| v.is_active())
+            || self.svoices.iter().any(|v| v.is_active())
+            || self.drums.iter().any(|d| d.active);
+        let audible: Vec<bool> = self.mix.iter().map(|m| synth_on && !m.mute && (!any_solo || m.solo)).collect();
         // Neural amp models are expensive: skip them for tracks nobody hears, and run the
         // rest in parallel (each track's chain is independent).
         use rayon::prelude::*;
@@ -628,8 +807,8 @@ impl Engine {
             }
             let (rl, rr) = self.reverb.process(send);
             let c = self.click_buf[i];
-            let l = soft_limit((l + rl + c) * self.master);
-            let r = soft_limit((r + rr + c) * self.master);
+            let l = soft_limit((l + rl + c + self.back_buf[0][i]) * self.master);
+            let r = soft_limit((r + rr + c + self.back_buf[1][i]) * self.master);
             match channels {
                 1 => frame[0] = 0.5 * (l + r),
                 _ => {
@@ -644,3 +823,103 @@ impl Engine {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        Engine::new(48_000.0, Arc::new(Shared::default()), None)
+    }
+
+    #[test]
+    fn pause_rewinds_to_the_loop_start() {
+        let mut e = engine();
+        e.handle(Command::Loop(Some((1920, 7680))));
+        e.handle(Command::Seek(5000));
+        e.handle(Command::Play);
+        e.pos = 5500.0;
+        e.handle(Command::Pause);
+        assert!(!e.playing, "pause should stop playback");
+        assert_eq!(e.pos as u64, 1920, "pause inside a loop should rewind to its start");
+    }
+
+    #[test]
+    fn pause_without_a_loop_stays_put() {
+        let mut e = engine();
+        e.handle(Command::Play);
+        e.pos = 5500.0;
+        e.handle(Command::Pause);
+        assert_eq!(e.pos as u64, 5500, "pause without a loop should hold the position");
+    }
+
+    /// In Song mode the recording sets the pace: it is read at exactly one second per second
+    /// however the band's tempo differs from the tab, and the tab is carried along to match.
+    #[test]
+    fn song_mode_lets_the_recording_keep_time() {
+        use crate::backing::{AlignStatus, Alignment};
+        use crate::model::{MeasureHeader, Song};
+        use crate::timeline::Timeline;
+
+        let mut song = Song { tempo: 120, ..Default::default() };
+        for i in 0..20 {
+            song.measure_headers.push(MeasureHeader {
+                number: i + 1,
+                start: i as u32 * 4 * TPQ,
+                numerator: 4,
+                denominator: 4,
+                repeat_close: -1,
+                ..Default::default()
+            });
+        }
+        let sched = Arc::new(Schedule { events: vec![], clicks: vec![], timeline: Timeline::build(&song), tracks: vec![] });
+        // Bar 1 five seconds in, then the band 25% slower than the tab for the first 10s of
+        // the tab and at the tab's tempo after that.
+        let map = vec![(0.0, 5.0), (10.0, 17.5), (40.0, 47.5)];
+        let align = Alignment {
+            offset: 5.0,
+            rate: 1.0,
+            confidence: 1.0,
+            hit_error: 0.0,
+            hit_part: String::new(),
+            checks: vec![],
+            max_drift: 0.0,
+            status: AlignStatus::Good,
+            summary: String::new(),
+            detail: String::new(),
+            map,
+        };
+        let set = Arc::new(BackingSet { stems: vec![], align });
+
+        let mut e = engine();
+        e.handle(Command::SetSchedule(sched.clone()));
+        e.handle(Command::Backing(Some(set)));
+        e.handle(Command::Source(Source::Song));
+        e.handle(Command::Seek(0));
+        e.handle(Command::Play);
+        let sr = e.sr as usize;
+        let tl = &sched.timeline;
+        for _ in 0..sr * 2 {
+            e.tick(&sched);
+        }
+        // Two seconds of recording from 5.0s is 1.6s of tab in the slow stretch.
+        assert!((e.clock - 7.0).abs() < 1e-6, "recording at {}", e.clock);
+        assert!((tl.seconds_at(e.pos) - 1.6).abs() < 0.001, "tab at {}s", tl.seconds_at(e.pos));
+
+        // Into the stretch at tab tempo, the two move together.
+        e.handle(Command::Seek(tl.tick_at_seconds(20.0) as u64));
+        let from = tl.seconds_at(e.pos);
+        for _ in 0..sr {
+            e.tick(&sched);
+        }
+        assert!((e.clock - 28.5).abs() < 1e-6, "recording at {} after a seek", e.clock);
+        assert!((tl.seconds_at(e.pos) - from - 1.0).abs() < 0.001, "tab moved {}s", tl.seconds_at(e.pos) - from);
+
+        // The synth keeps the tab's own time.
+        e.handle(Command::Source(Source::Synth));
+        let from = tl.seconds_at(e.pos);
+        for _ in 0..sr {
+            e.tick(&sched);
+        }
+        assert!((tl.seconds_at(e.pos) - from - 1.0).abs() < 0.001);
+    }
+}

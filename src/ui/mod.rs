@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 pub(crate) mod screenshots;
+mod song;
 mod tab;
 mod theme;
 
@@ -12,11 +13,13 @@ use eframe::egui;
 use egui::{Align, Color32, CornerRadius, Key, Margin, Modifiers, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 
 use crate::audio::AudioOut;
+use crate::backing::{AlignStatus, BackingSet};
 use crate::model::{Song, ToneKind};
 use crate::setup::{self, Settings, SharedProgress};
-use crate::synth::Command;
+use crate::synth::{Command, Source};
 use crate::synth::sampler::{BankId, Library, SlotState};
 use crate::timeline::{Schedule, build_schedule};
+use song::{Loading, StemMix};
 use tab::{Paint, TabLayout};
 use theme::{ACCENT, BG, BLUE, BORDER, CARD, CARD_HOVER, DANGER, GOOD, MUTED, SURFACE, TEXT, WARN};
 
@@ -83,6 +86,16 @@ pub struct App {
     /// Track card rects from the previous frame (click targets behind the card contents).
     track_rects: Vec<Rect>,
     title: String,
+    /// The recording attached to this song, once it has been lined up with the tab.
+    backing: Option<Arc<BackingSet>>,
+    backing_load: Option<Arc<Loading>>,
+    backing_error: Option<String>,
+    backing_volume: f32,
+    /// Hand adjustment to the alignment for this song, in seconds.
+    backing_trim: f64,
+    stem_mix: Vec<StemMix>,
+    source: Source,
+    show_align: bool,
 }
 
 impl App {
@@ -93,6 +106,7 @@ impl App {
             Err(e) => (None, Some(format!("No audio output: {e:#}"))),
         };
         let settings = Settings::load();
+        let backing_volume = settings.backing_volume;
         let library = Library::new();
         let ic = icon();
         let icon = cc.egui_ctx.load_texture(
@@ -130,10 +144,19 @@ impl App {
             icon,
             track_rects: Vec::new(),
             title: String::new(),
+            backing: None,
+            backing_load: None,
+            backing_error: None,
+            backing_volume,
+            backing_trim: 0.0,
+            stem_mix: Vec::new(),
+            source: Source::Synth,
+            show_align: false,
         };
         app.send(Command::MasterVolume(app.master));
         app.send(Command::Metronome(app.metronome));
         app.send(Command::CountIn(app.count_in));
+        app.send(Command::BackingVolume(app.backing_volume));
         if let Some(p) = path {
             app.open(&p);
         }
@@ -291,8 +314,15 @@ impl App {
                 self.loop_on = false;
                 self.scroll_to = Some(0.0);
                 self.error = None;
+                self.backing = None;
+                self.backing_load = None;
+                self.backing_error = None;
+                self.stem_mix.clear();
+                self.send(Command::Backing(None));
+                self.set_source(Source::Synth);
                 self.settings.push_recent(path);
                 self.settings.save();
+                self.restore_audio();
             }
             Err(e) => self.error = Some(format!("Could not open {}: {e:#}", path.display())),
         }
@@ -389,6 +419,7 @@ impl App {
         let mut clear_loop = false;
         let mut loop_current = false;
         let mut metronome = false;
+        let mut swap_source = false;
         let mut track_key = None;
         ctx.input_mut(|i| {
             // Consume Space so focused buttons don't also react.
@@ -410,6 +441,7 @@ impl App {
             clear_loop = i.consume_key(Modifiers::NONE, Key::Escape);
             loop_current = i.consume_key(Modifiers::NONE, Key::L);
             metronome = i.consume_key(Modifiers::NONE, Key::M);
+            swap_source = i.consume_key(Modifiers::NONE, Key::S);
             let nums = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
             for (k, key) in nums.iter().enumerate() {
                 if i.consume_key(Modifiers::NONE, *key) {
@@ -428,6 +460,9 @@ impl App {
         }
         if speed_delta != 0 {
             self.set_bpm(self.target_bpm() + speed_delta as f64);
+        }
+        if swap_source && self.song_available() {
+            self.set_source(if self.source == Source::Song { Source::Synth } else { Source::Song });
         }
         if measure_delta != 0 {
             if let Some((m, _)) = self.current_measure() {
@@ -525,6 +560,25 @@ impl App {
             };
             notices.push((WARN, msg, self.download.is_none().then_some(("Download sounds", 1))));
         }
+        if let Some(set) = &self.backing {
+            let a = &set.align;
+            if a.status == AlignStatus::Failed {
+                notices.push((
+                    DANGER,
+                    format!("The audio could not be lined up with this tab. {}", a.summary),
+                    Some(("Why?", 3)),
+                ));
+            } else if a.status == AlignStatus::Warn && self.source == Source::Song {
+                notices.push((WARN, a.summary.clone(), Some(("See the checks", 3))));
+            }
+            if self.source == Source::Song && (self.speed - 1.0).abs() > 1e-6 {
+                notices.push((
+                    WARN,
+                    "Changing the tempo stretches the recording, so it plays back off pitch.".into(),
+                    Some(("Reset tempo", 4)),
+                ));
+            }
+        }
         if self.uses_nam() {
             if let NamState::Failed(e) = &*self.nam_state.lock().unwrap() {
                 notices.push((DANGER, format!("Amp model failed to load: {e}"), Some(("Choose another…", 2))));
@@ -550,6 +604,11 @@ impl App {
                                     match id {
                                         0 => self.error = None,
                                         1 => self.start_download(),
+                                        3 => self.show_align = true,
+                                        4 => {
+                                            let orig = self.orig_bpm();
+                                            self.set_bpm(orig);
+                                        }
                                         _ => self.choose_nam(),
                                     }
                                 }
@@ -636,6 +695,10 @@ impl App {
             stat(ui, "BAR", &format!("{bar} / {n}"));
             let score_bpm = self.loaded.as_ref().map(|l| l.sched.timeline.bpm_at(self.pos() as u64)).unwrap_or(120.0);
             stat(ui, "NOW", &format!("♩ {:.0}", score_bpm * self.speed));
+            if self.backing.is_some() {
+                ui.add_space(8.0);
+                self.source_switch(ui);
+            }
 
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().slider_width = 90.0;
@@ -776,6 +839,7 @@ impl App {
             ui.painter().rect_filled(stripe, 2.0, theme::TRACK_COLORS[i % theme::TRACK_COLORS.len()]);
             ui.add_space(2.0);
         }
+        self.song_panel(ui);
         ui.add_space(14.0);
         egui::CollapsingHeader::new(RichText::new("Keyboard shortcuts").small().color(MUTED)).default_open(false).show(ui, |ui| {
             egui::Grid::new("keys").num_columns(2).spacing(vec2(12.0, 4.0)).show(ui, |ui| {
@@ -788,6 +852,7 @@ impl App {
                     ("Home", "Back to start"),
                     ("+ / −", "Tempo ±5 BPM"),
                     ("M", "Metronome"),
+                    ("S", "Synth / song"),
                     ("1–9", "Switch track"),
                     ("Ctrl+O", "Open file"),
                 ] {
@@ -1088,7 +1153,8 @@ impl eframe::App for App {
             self.open(p);
         }
         self.poll_download();
-        if !self.show_setup {
+        self.poll_audio();
+        if !self.show_setup && !self.show_align {
             self.handle_keys(ui);
         }
 
@@ -1128,11 +1194,17 @@ impl eframe::App for App {
             }
         });
         self.setup_dialog(&ctx);
+        self.align_dialog(&ctx);
 
         if self.settings_dirty && !ctx.input(|i| i.pointer.any_down()) {
             self.settings.master = self.master;
             self.settings.metronome = self.metronome;
             self.settings.count_in = self.count_in;
+            self.settings.backing_volume = self.backing_volume;
+            if let Some(l) = &self.loaded {
+                let path = l.path.clone();
+                self.settings.remember_trim(&path, self.backing_trim);
+            }
             self.settings.save();
             self.settings_dirty = false;
         }

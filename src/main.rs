@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod audio;
+mod backing;
 mod gp;
 mod model;
 mod setup;
@@ -222,12 +223,68 @@ fn main() -> anyhow::Result<()> {
         Some("--render") => render(&args),
         Some("--nam-render") => nam_render(&args),
         Some("--download-sounds") => download_sounds(),
+        Some("--align") => align(&args),
         Some("--help") | Some("-h") => {
-            println!("usage: guitar-practice-tool [song.gp5]\n       guitar-practice-tool --dump <song>\n       guitar-practice-tool --render <song> <out.wav> [--speed x] [--solo n] [--start-measure m] [--seconds s]\n           [--synth] [--nam model.nam | --no-nam] [--single]\n       guitar-practice-tool --nam-render <model.nam> <in.wav> <out.wav>\n       guitar-practice-tool --download-sounds");
+            println!("usage: guitar-practice-tool [song.gp5]\n       guitar-practice-tool --dump <song>\n       guitar-practice-tool --render <song> <out.wav> [--speed x] [--solo n] [--start-measure m] [--seconds s]\n           [--synth] [--nam model.nam | --no-nam] [--single]\n       guitar-practice-tool --nam-render <model.nam> <in.wav> <out.wav>\n       guitar-practice-tool --align <song> <audio...>\n       guitar-practice-tool --download-sounds");
             Ok(())
         }
         _ => run_gui(args.first().map(PathBuf::from)),
     }
+}
+
+/// Report how a recording (or a set of stems) lines up with a tab, without opening the GUI.
+fn align(args: &[String]) -> anyhow::Result<()> {
+    if args.len() < 3 {
+        anyhow::bail!("usage: --align <song.gp5> <audio...>");
+    }
+    let song = gp::load_file(&PathBuf::from(&args[1]))?;
+    let tones: Vec<_> = song.tracks.iter().map(|t| t.default_tone()).collect();
+    let sched = timeline::build_schedule(&song, &tones);
+    let paths: Vec<PathBuf> = args[2..].iter().map(PathBuf::from).collect();
+    let t0 = std::time::Instant::now();
+    let b = backing::BackingSet::load(&paths, &sched, |s| println!("{s}")).map_err(|e| anyhow::anyhow!(e))?;
+    println!("analysed in {:.1}s", t0.elapsed().as_secs_f64());
+    for s in &b.stems {
+        println!(
+            "stem {:<10} hits within {:>4.0}ms ({:>3.0}% found), corr {:>4.0}%  {}",
+            s.kind.label(),
+            s.error * 1000.0,
+            s.found * 100.0,
+            s.confidence * 100.0,
+            s.name
+        );
+    }
+    println!("{}", b.align.detail);
+    println!("status: {:?} - {}", b.align.status, b.align.summary);
+    println!("{:>8}  {:>6}  {:>9}  {:>6}", "time", "bar", "drift", "match");
+    for c in &b.align.checks {
+        println!(
+            "{:>7.1}s  {:>6}  {:>8.3}s  {:>5.0}%{}",
+            c.time,
+            c.bar,
+            c.drift,
+            c.confidence * 100.0,
+            if c.matched { "" } else { "  (not confirmed)" }
+        );
+    }
+    // Where each bar of the tab lands in the recording, in playback order, so a report like
+    // "at bar 13 the record is playing bar 17" can be checked against the numbers directly.
+    if std::env::var_os("GPT_ALIGN_BARS").is_some() {
+        let tl = &sched.timeline;
+        println!("{:>5}  {:>4}  {:>6}  {:>9}  {:>9}", "play", "bar", "bpm", "tab", "record");
+        for (k, m) in tl.measures.iter().enumerate() {
+            let s = tl.seconds_at(m.start as f64);
+            println!(
+                "{:>5}  {:>4}  {:>6.1}  {:>8.2}s  {:>8.2}s",
+                k + 1,
+                m.index + 1,
+                tl.bpm_at(m.start),
+                s,
+                b.align.audio_time(s)
+            );
+        }
+    }
+    Ok(())
 }
 
 fn download_sounds() -> anyhow::Result<()> {
