@@ -143,7 +143,9 @@ impl TabLayout {
                             continue;
                         }
                         let rel = b.start.saturating_sub(h.start).min(len.saturating_sub(1));
-                        let Ok(ci) = cols.binary_search_by_key(&rel, |c| c.tick) else { continue };
+                        let Ok(ci) = cols.binary_search_by_key(&rel, |c| c.tick) else {
+                            continue;
+                        };
                         let c = &mut cols[ci];
                         if b.effects.wide_vibrato {
                             c.flags |= F_VIB;
@@ -296,7 +298,9 @@ fn build_links(song: &Song, track: &Track) -> Vec<Vec<Link>> {
         // per string: (measure, tick, fret, hammer, slide)
         let mut last: Vec<Option<(usize, u32, i32, bool, bool)>> = vec![None; track.strings.len().max(1)];
         for (mi, h) in song.measure_headers.iter().enumerate() {
-            let Some(v) = track.measures.get(mi).and_then(|m| m.voices.get(vi)) else { continue };
+            let Some(v) = track.measures.get(mi).and_then(|m| m.voices.get(vi)) else {
+                continue;
+            };
             for b in &v.beats {
                 if b.status == BeatStatus::Empty {
                     continue;
@@ -638,7 +642,9 @@ impl Paint<'_> {
         let lay = self.layout;
         let m = &lay.meas[mi];
         let track = &self.song.tracks[lay.track];
-        let Some(measure) = track.measures.get(mi) else { return };
+        let Some(measure) = track.measures.get(mi) else {
+            return;
+        };
         for (ci, c) in m.cols.iter().enumerate() {
             let x = m.x + c.x;
             let next_x = m.cols.get(ci + 1).map(|n| m.x + n.x).unwrap_or(m.x + m.w);
@@ -761,7 +767,9 @@ impl Paint<'_> {
         let lay = self.layout;
         let m = &lay.meas[mi];
         let h = &self.song.measure_headers[mi];
-        let Some(v) = self.song.tracks[lay.track].measures.get(mi).and_then(|me| me.voices.first()) else { return };
+        let Some(v) = self.song.tracks[lay.track].measures.get(mi).and_then(|me| me.voices.first()) else {
+            return;
+        };
         let y0 = bottom + 9.0;
         let y1 = bottom + 27.0;
         let st = Stroke::new(1.1, INK);

@@ -878,7 +878,9 @@ fn resolve_ties(song: &mut Song) {
         for v in 0..voices {
             let mut last = [None::<i32>; 8];
             for m in track.measures.iter_mut() {
-                let Some(voice) = m.voices.get_mut(v) else { continue };
+                let Some(voice) = m.voices.get_mut(v) else {
+                    continue;
+                };
                 for beat in voice.beats.iter_mut() {
                     if beat.status == BeatStatus::Empty {
                         continue;

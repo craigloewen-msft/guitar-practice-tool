@@ -1,7 +1,7 @@
 //! Physically-inspired plucked string (extended Karplus-Strong). For guitars this is the
 //! dry pickup signal (DI) that drives the neural amp model.
 
-use super::dsp::{flush, midi_to_hz, Rng};
+use super::dsp::{Rng, flush, midi_to_hz};
 use crate::model::ToneKind;
 use crate::timeline::NoteEvent;
 
@@ -133,11 +133,7 @@ impl StringVoice {
         }
         let k = ((ev.pitch - 40.0) / 48.0).clamp(-0.5, 1.5);
         let base = self.params.t60_low * (self.params.t60_high / self.params.t60_low).powf(k);
-        if ev.palm_mute {
-            (0.32 - 0.12 * k).clamp(0.12, 0.35)
-        } else {
-            base
-        }
+        if ev.palm_mute { (0.32 - 0.12 * k).clamp(0.12, 0.35) } else { base }
     }
 
     fn sustain_loop_a(&self, ev: &NoteEvent) -> f32 {

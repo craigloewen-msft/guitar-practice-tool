@@ -1,12 +1,12 @@
 //! Audio output (cpal) and offline rendering.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -265,7 +265,9 @@ mod tests {
     #[test]
     #[ignore]
     fn live_playback_has_no_underruns() {
-        let Some(path) = crate::ui::screenshots::test_song() else { return };
+        let Some(path) = crate::ui::screenshots::test_song() else {
+            return;
+        };
         let song = crate::gp::load_file(&path).unwrap();
         let tones: Vec<_> = song.tracks.iter().map(|t| t.default_tone()).collect();
         let sched = Arc::new(crate::timeline::build_schedule(&song, &tones));

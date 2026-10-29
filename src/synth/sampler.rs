@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
-use super::dsp::{flush, midi_to_hz, Rng};
+use super::dsp::{Rng, flush, midi_to_hz};
 use super::string::State;
 use crate::model::ToneKind;
 use crate::timeline::NoteEvent;
@@ -118,7 +118,9 @@ impl Bank {
         let mut copied: HashMap<(i32, i32), (usize, usize)> = HashMap::new();
         let mut zones = Vec::new();
         for pr in preset.get_regions() {
-            let Some(inst) = sf.get_instruments().get(pr.get_instrument_id()) else { continue };
+            let Some(inst) = sf.get_instruments().get(pr.get_instrument_id()) else {
+                continue;
+            };
             for r in inst.get_regions() {
                 let key_lo = r.get_key_range_start().max(pr.get_key_range_start());
                 let key_hi = r.get_key_range_end().min(pr.get_key_range_end());
@@ -127,7 +129,9 @@ impl Bank {
                 if key_lo > key_hi || vel_lo > vel_hi {
                     continue;
                 }
-                let Some(sh) = headers.get(r.get_sample_id()) else { continue };
+                let Some(sh) = headers.get(r.get_sample_id()) else {
+                    continue;
+                };
                 let rate = sh.get_sample_rate().max(1) as f32;
                 let s0 = r.get_sample_start().max(0);
                 let s1 = r.get_sample_end().min(wave.len() as i32);
@@ -215,11 +219,7 @@ impl Bank {
             // No exact velocity match: use the closest velocity layer.
             let dist = |zi: u32| {
                 let z = &self.zones[zi as usize];
-                if vel < z.vel_lo as i32 {
-                    z.vel_lo as i32 - vel
-                } else {
-                    vel - z.vel_hi as i32
-                }
+                if vel < z.vel_lo as i32 { z.vel_lo as i32 - vel } else { vel - z.vel_hi as i32 }
             };
             if let Some(best) = list.iter().map(|&zi| dist(zi)).min() {
                 for &zi in list {
