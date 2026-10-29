@@ -6,6 +6,7 @@ pub mod dsp;
 pub mod nam;
 pub mod reverb;
 pub mod sampler;
+pub mod stretch;
 pub mod string;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,6 +22,7 @@ use dsp::{soft_limit, Rng};
 use reverb::Reverb;
 use nam::NamModel;
 use sampler::{gm_to_kit, Bank, BankId, SampleVoice};
+use stretch::Stretcher;
 use string::{State, StringVoice, Take};
 
 const MAX_STRING_VOICES: usize = 96;
@@ -159,6 +161,11 @@ pub struct Engine {
     /// transport, which happens again after every seek or change of source.
     clock: f64,
     back_buf: [Vec<f32>; 2],
+    /// Plays the recording slower or faster than it was made without changing its pitch.
+    stretch: Stretcher,
+    /// How much of the stretched recording is heard rather than the plain read (0–1), so moving
+    /// between the two doesn't click.
+    stretch_mix: f32,
     shared: Arc<Shared>,
     rx: Option<Receiver<Command>>,
 }
@@ -208,6 +215,8 @@ impl Engine {
             clock: f64::NAN,
             back_fade: None,
             back_buf: [vec![0.0; BLOCK], vec![0.0; BLOCK]],
+            stretch: Stretcher::new(sr),
+            stretch_mix: 0.0,
             shared,
             rx,
         }
@@ -305,6 +314,7 @@ impl Engine {
                 self.back_t = f64::NAN;
                 self.clock = f64::NAN;
                 self.back_fade = None;
+                self.stretch.stop();
             }
             Command::Source(s) => {
                 if self.source != s {
@@ -689,24 +699,59 @@ impl Engine {
                         self.back_fade = Some((self.back_t, fade_len));
                     }
                     self.back_t = t;
+                    let n_stems = b.stems.len().min(MAX_STEMS);
+                    for (g, want) in self.stem_cur.iter_mut().zip(self.stem_gain).take(n_stems) {
+                        *g += (want - *g).clamp(-gain_step, gain_step);
+                    }
+                    // Played at any rate but its own, the recording is time-stretched so it keeps
+                    // its pitch; a plain read at a different rate would shift it.
+                    let rate = step * sr as f64;
+                    let stretched = if (rate - 1.0).abs() > 0.002 { 1.0 } else { 0.0 };
+                    self.stretch_mix += (stretched - self.stretch_mix).clamp(-gain_step, gain_step);
                     // Every stem shares one time scale, so they are all read at the same point.
                     let fade = self.back_fade;
                     let (mut l, mut r) = (0.0f32, 0.0f32);
-                    for (si, s) in b.stems.iter().enumerate().take(MAX_STEMS) {
-                        let g = &mut self.stem_cur[si];
-                        *g += (self.stem_gain[si] - *g).clamp(-gain_step, gain_step);
-                        if *g <= 0.0 {
-                            continue;
+                    if self.stretch_mix < 1.0 {
+                        for (si, s) in b.stems.iter().enumerate().take(n_stems) {
+                            let g = self.stem_cur[si];
+                            if g <= 0.0 {
+                                continue;
+                            }
+                            let (mut sl, mut sr) = s.sample_at(t);
+                            if let Some((ft, left)) = fade {
+                                let (fl, fr) = s.sample_at(ft);
+                                let k = left / fade_len;
+                                sl += (fl - sl) * k;
+                                sr += (fr - sr) * k;
+                            }
+                            l += sl * g;
+                            r += sr * g;
                         }
-                        let (mut sl, mut sr) = s.sample_at(t);
-                        if let Some((ft, left)) = fade {
-                            let (fl, fr) = s.sample_at(ft);
-                            let k = left / fade_len;
-                            sl += (fl - sl) * k;
-                            sr += (fr - sr) * k;
-                        }
-                        l += sl * *g;
-                        r += sr * *g;
+                    }
+                    let audible = back_target > 0.0 || self.back_gain > 0.0;
+                    if self.stretch_mix > 0.0 && audible {
+                        // While paused the transport stands still, so the stretch carries on by
+                        // itself until it has faded out.
+                        let now = (self.playing && self.count_in_left <= 0.0).then_some(t);
+                        let gains = &self.stem_cur;
+                        let (xl, xr) = self.stretch.next(now, rate, |start, dt, ol, or| {
+                            ol.fill(0.0);
+                            or.fill(0.0);
+                            for (s, &g) in b.stems.iter().zip(gains).take(n_stems) {
+                                if g <= 0.0 {
+                                    continue;
+                                }
+                                for (i, (a, c)) in ol.iter_mut().zip(or.iter_mut()).enumerate() {
+                                    let (x, y) = s.sample_at(start + i as f64 * dt);
+                                    *a += x * g;
+                                    *c += y * g;
+                                }
+                            }
+                        });
+                        l += (xl - l) * self.stretch_mix;
+                        r += (xr - r) * self.stretch_mix;
+                    } else {
+                        self.stretch.stop();
                     }
                     if let Some((ft, left)) = &mut self.back_fade {
                         *ft += step;
@@ -852,11 +897,8 @@ mod tests {
         assert_eq!(e.pos as u64, 5500, "pause without a loop should hold the position");
     }
 
-    /// In Song mode the recording sets the pace: it is read at exactly one second per second
-    /// however the band's tempo differs from the tab, and the tab is carried along to match.
-    #[test]
-    fn song_mode_lets_the_recording_keep_time() {
-        use crate::backing::{AlignStatus, Alignment};
+    /// Twenty bars of 4/4 at 120bpm with no notes.
+    fn empty_sched() -> Arc<Schedule> {
         use crate::model::{MeasureHeader, Song};
         use crate::timeline::Timeline;
 
@@ -871,12 +913,14 @@ mod tests {
                 ..Default::default()
             });
         }
-        let sched = Arc::new(Schedule { events: vec![], clicks: vec![], timeline: Timeline::build(&song), tracks: vec![] });
-        // Bar 1 five seconds in, then the band 25% slower than the tab for the first 10s of
-        // the tab and at the tab's tempo after that.
-        let map = vec![(0.0, 5.0), (10.0, 17.5), (40.0, 47.5)];
-        let align = Alignment {
-            offset: 5.0,
+        Arc::new(Schedule { events: vec![], clicks: vec![], timeline: Timeline::build(&song), tracks: vec![] })
+    }
+
+    /// A good alignment following `map` (tab seconds, recording seconds).
+    fn aligned(map: Vec<(f64, f64)>) -> crate::backing::Alignment {
+        use crate::backing::{AlignStatus, Alignment};
+        Alignment {
+            offset: map[0].1 - map[0].0,
             rate: 1.0,
             confidence: 1.0,
             hit_error: 0.0,
@@ -887,7 +931,17 @@ mod tests {
             summary: String::new(),
             detail: String::new(),
             map,
-        };
+        }
+    }
+
+    /// In Song mode the recording sets the pace: it is read at exactly one second per second
+    /// however the band's tempo differs from the tab, and the tab is carried along to match.
+    #[test]
+    fn song_mode_lets_the_recording_keep_time() {
+        let sched = empty_sched();
+        // Bar 1 five seconds in, then the band 25% slower than the tab for the first 10s of
+        // the tab and at the tab's tempo after that.
+        let align = aligned(vec![(0.0, 5.0), (10.0, 17.5), (40.0, 47.5)]);
         let set = Arc::new(BackingSet { stems: vec![], align });
 
         let mut e = engine();
@@ -921,5 +975,40 @@ mod tests {
             e.tick(&sched);
         }
         assert!((tl.seconds_at(e.pos) - from - 1.0).abs() < 0.001);
+    }
+
+    /// Slowing the song down slows the recording without dropping its pitch.
+    #[test]
+    fn slowing_the_recording_keeps_its_pitch() {
+        use crate::backing::Stem;
+        use crate::synth::string::tests::estimate_hz;
+
+        let sr = 48_000u32;
+        let samples: Vec<i16> = (0..sr as usize * 20)
+            .flat_map(|i| {
+                let v = (0.3 * (std::f64::consts::TAU * 220.0 * i as f64 / sr as f64).sin() * 32767.0) as i16;
+                [v, v]
+            })
+            .collect();
+
+        for speed in [1.0, 0.5, 0.8] {
+            let stem = Stem::from_samples(sr, samples.clone());
+            let set = BackingSet { stems: vec![stem], align: aligned(vec![(0.0, 0.0), (40.0, 40.0)]) };
+            let mut e = engine();
+            e.handle(Command::SetSchedule(empty_sched()));
+            e.handle(Command::Backing(Some(Arc::new(set))));
+            e.handle(Command::Source(Source::Song));
+            e.handle(Command::Speed(speed));
+            // Two seconds in.
+            e.handle(Command::Seek(TPQ as u64 * 4));
+            e.handle(Command::Play);
+            let mut out = vec![0.0; sr as usize * 2];
+            e.process(&mut out, 2);
+            let left: Vec<f32> = out.iter().step_by(2).skip(sr as usize / 10).copied().collect();
+            let hz = estimate_hz(&left, sr as f32);
+            assert!((hz - 220.0).abs() < 1.0, "speed {speed}: heard {hz} Hz");
+            // The recording still moves at the slower pace.
+            assert!((e.clock - 2.0 - speed).abs() < 1e-3, "speed {speed}: recording at {}", e.clock);
+        }
     }
 }

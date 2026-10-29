@@ -138,6 +138,21 @@ pub struct Stem {
 }
 
 impl Stem {
+    /// A stem from interleaved stereo samples, for tests.
+    #[cfg(test)]
+    pub(crate) fn from_samples(sr: u32, samples: Vec<i16>) -> Stem {
+        Stem {
+            path: PathBuf::new(),
+            name: String::new(),
+            kind: StemKind::Mix,
+            sr,
+            samples: Arc::new(samples),
+            confidence: 1.0,
+            error: 0.0,
+            found: 1.0,
+        }
+    }
+
     pub fn view(&self) -> Audio<'_> {
         Audio { sr: self.sr, samples: &self.samples }
     }

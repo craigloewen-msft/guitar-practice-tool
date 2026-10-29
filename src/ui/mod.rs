@@ -571,13 +571,6 @@ impl App {
             } else if a.status == AlignStatus::Warn && self.source == Source::Song {
                 notices.push((WARN, a.summary.clone(), Some(("See the checks", 3))));
             }
-            if self.source == Source::Song && (self.speed - 1.0).abs() > 1e-6 {
-                notices.push((
-                    WARN,
-                    "Changing the tempo stretches the recording, so it plays back off pitch.".into(),
-                    Some(("Reset tempo", 4)),
-                ));
-            }
         }
         if self.uses_nam() {
             if let NamState::Failed(e) = &*self.nam_state.lock().unwrap() {
@@ -605,10 +598,6 @@ impl App {
                                         0 => self.error = None,
                                         1 => self.start_download(),
                                         3 => self.show_align = true,
-                                        4 => {
-                                            let orig = self.orig_bpm();
-                                            self.set_bpm(orig);
-                                        }
                                         _ => self.choose_nam(),
                                     }
                                 }
